@@ -1,5 +1,5 @@
 {
-  "name": "@shahin/workflows-sdk",
+  "name": "@abshahin/workflows-sdk",
   "version": "0.1.0",
   "type": "module",
   "description": "TypeScript SDK for dispatching typed workflow events to a Cloudflare Worker runtime.",

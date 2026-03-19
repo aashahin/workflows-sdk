@@ -1,4 +1,4 @@
-# @shahin/workflows-sdk
+# @abshahin/workflows-sdk
 
 TypeScript SDK for dispatching typed background workflow events to a Cloudflare Worker runtime.
 
@@ -8,7 +8,7 @@ Related worker runtime: `https://github.com/aashahin/cloudflare-workflows-worker
 
 ## Why this package exists
 
-`@shahin/workflows-sdk` separates event production from workflow execution.
+`@abshahin/workflows-sdk` separates event production from workflow execution.
 
 - Producers only need to know how to send typed events
 - The transport layer decides how those events reach the workflow runtime
@@ -31,17 +31,17 @@ Related worker runtime: `https://github.com/aashahin/cloudflare-workflows-worker
 Inside this monorepo:
 
 ```json
-"@shahin/workflows-sdk": "workspace:*"
+"@abshahin/workflows-sdk": "workspace:*"
 ```
 
 Once published publicly, install it with your package manager of choice:
 
 ```bash
-bun add @shahin/workflows-sdk
+bun add @abshahin/workflows-sdk
 ```
 
 ```bash
-npm install @shahin/workflows-sdk
+npm install @abshahin/workflows-sdk
 ```
 
 ## Quick start
@@ -53,7 +53,7 @@ import {
   NotificationJobs,
   PaymentJobs,
   createWorkflowsClient,
-} from "@shahin/workflows-sdk";
+} from "@abshahin/workflows-sdk";
 
 const client = createWorkflowsClient({
   transport: new HttpTransport({
@@ -184,7 +184,7 @@ import {
   EmailJobs,
   HttpTransport,
   createWorkflowsClient,
-} from "@shahin/workflows-sdk";
+} from "@abshahin/workflows-sdk";
 
 const client = createWorkflowsClient({
   transport: new HttpTransport({
@@ -212,7 +212,7 @@ import {
   HttpTransport,
   NotificationJobs,
   createWorkflowsClient,
-} from "@shahin/workflows-sdk";
+} from "@abshahin/workflows-sdk";
 
 const client = createWorkflowsClient({
   transport: new HttpTransport({
@@ -241,7 +241,7 @@ import {
   HttpTransport,
   PaymentJobs,
   createWorkflowsClient,
-} from "@shahin/workflows-sdk";
+} from "@abshahin/workflows-sdk";
 
 const client = createWorkflowsClient({
   transport: new HttpTransport({
@@ -268,7 +268,7 @@ await paymentJobs.processPayout({
 Use dual-run mode when migrating between workflow backends or validating a new transport.
 
 ```typescript
-import { HttpTransport, createWorkflowsClient } from "@shahin/workflows-sdk";
+import { HttpTransport, createWorkflowsClient } from "@abshahin/workflows-sdk";
 
 const primaryTransport = new HttpTransport({
   baseUrl: "https://primary.example.com",
@@ -294,7 +294,7 @@ The primary transport result is returned. Shadow transport failures are logged a
 Use `onSendExhausted` when you want to store failed dispatches for later replay instead of letting producer-side business logic fail immediately.
 
 ```typescript
-import { HttpTransport, createWorkflowsClient } from "@shahin/workflows-sdk";
+import { HttpTransport, createWorkflowsClient } from "@abshahin/workflows-sdk";
 
 const client = createWorkflowsClient({
   transport: new HttpTransport({
@@ -364,8 +364,11 @@ The SDK exposes sub-path imports for tree-shaking or isolated usage:
 import {
   EMAIL_EVENTS,
   type ResetPasswordEmailData,
-} from "@shahin/workflows-sdk/contracts";
-import { deriveIdempotencyKey, withRetry } from "@shahin/workflows-sdk/helpers";
+} from "@abshahin/workflows-sdk/contracts";
+import {
+  deriveIdempotencyKey,
+  withRetry,
+} from "@abshahin/workflows-sdk/helpers";
 ```
 
 ## Migration from Inngest
