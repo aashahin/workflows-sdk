@@ -4,6 +4,8 @@ TypeScript SDK for dispatching typed background workflow events to a Cloudflare 
 
 The package is transport-oriented and framework-agnostic. It provides a client, an HTTP transport, strongly typed event contracts, retry utilities, and job facades for email, notification, and payment workflows.
 
+It also provides a dedicated WhatsApp workflow facade for asynchronous template-message dispatch.
+
 Related worker runtime: `https://github.com/aashahin/cloudflare-workflows-worker`
 
 ## Why this package exists
@@ -19,8 +21,9 @@ Related worker runtime: `https://github.com/aashahin/cloudflare-workflows-worker
 ## Features
 
 - Typed contracts for email, notification, and payment events
+- Typed contracts for WhatsApp template-send events
 - HTTP transport for dispatching event batches to a worker endpoint
-- Producer-friendly job facades: `EmailJobs`, `NotificationJobs`, `PaymentJobs`
+- Producer-friendly job facades: `EmailJobs`, `NotificationJobs`, `PaymentJobs`, `WhatsappJobs`
 - Transport retry support with exponential backoff
 - Optional dual-run mode for phased migrations
 - Optional `onSendExhausted` hook for persisting failed transport attempts
@@ -52,6 +55,7 @@ import {
   HttpTransport,
   NotificationJobs,
   PaymentJobs,
+  WhatsappJobs,
   createWorkflowsClient,
 } from "@abshahin/workflows-sdk";
 
@@ -65,6 +69,7 @@ const client = createWorkflowsClient({
 const emailJobs = new EmailJobs(client, () => true);
 const notificationJobs = new NotificationJobs(client);
 const paymentJobs = new PaymentJobs(client);
+const whatsappJobs = new WhatsappJobs(client);
 
 await emailJobs.sendResetPasswordEmail({
   email: "user@example.com",
@@ -90,6 +95,19 @@ await paymentJobs.processPayout({
   walletId: "wallet_001",
   amount: 250,
   currency: "USD",
+});
+
+await whatsappJobs.sendTemplateMessage({
+  tenantId: "tenant_123",
+  recipientPhone: "+15551234567",
+  templateKey: "order_confirmed",
+  triggerEvent: "order.completed",
+  variables: {
+    customer_name: "John",
+    course_name: "Arabic 101",
+    access_link: "https://tenant.example.com/dashboard",
+  },
+  customerId: "customer_789",
 });
 ```
 
@@ -174,6 +192,16 @@ Current method:
 - `processPayout`
 
 This dispatches the payout orchestration workflow handled by the worker runtime.
+
+### `WhatsappJobs`
+
+Facade for WhatsApp-related workflow events.
+
+Current method:
+
+- `sendTemplateMessage`
+
+This dispatches an asynchronous template-message send that the backend executes through its WhatsApp delivery service.
 
 ## Usage examples
 
@@ -261,6 +289,37 @@ await paymentJobs.processPayout({
 });
 ```
 
+### WhatsApp workflow dispatch
+
+```typescript
+import {
+  HttpTransport,
+  WhatsappJobs,
+  createWorkflowsClient,
+} from "@abshahin/workflows-sdk";
+
+const client = createWorkflowsClient({
+  transport: new HttpTransport({
+    baseUrl: "https://workflows.example.com",
+    authToken: "secret",
+  }),
+});
+
+const whatsappJobs = new WhatsappJobs(client);
+
+await whatsappJobs.sendTemplateMessage({
+  tenantId: "tenant_123",
+  recipientPhone: "+15551234567",
+  templateKey: "welcome_student",
+  triggerEvent: "enrollment.created",
+  variables: {
+    student_name: "John",
+    course_name: "Arabic 101",
+    start_link: "https://tenant.example.com/course/intro/learn",
+  },
+});
+```
+
 ## Advanced patterns
 
 ### Dual-run mode
@@ -341,6 +400,10 @@ When persistence succeeds, the client returns `{ ids: [] }` instead of throwing.
 
 - `payment/process-payout`
 
+### WhatsApp events
+
+- `whatsapp/send-template`
+
 ## Exports
 
 | Export                                                                                            | Description                   |
@@ -351,7 +414,9 @@ When persistence succeeds, the client returns `{ ids: [] }` instead of throwing.
 | `EmailJobs`                                                                                       | Email job facade              |
 | `NotificationJobs`                                                                                | Notification job facade       |
 | `PaymentJobs`                                                                                     | Payment job facade            |
+| `WhatsappJobs`                                                                                    | WhatsApp job facade           |
 | `EMAIL_EVENTS` / `NOTIFICATION_EVENTS` / `PAYMENT_EVENTS`                                         | Event name constants          |
+| `WHATSAPP_EVENTS`                                                                                 | WhatsApp event constants      |
 | `withRetry` / `getBackoffDelay` / `DEFAULT_RETRY_POLICY`                                          | Retry helpers                 |
 | `deriveIdempotencyKey` / `generateEventId`                                                        | Idempotency helpers           |
 | `WorkflowError` / `WorkflowSendError` / `WorkflowValidationError` / `WorkflowRetryExhaustedError` | Typed errors                  |

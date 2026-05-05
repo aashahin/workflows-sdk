@@ -28,6 +28,7 @@ export { HttpTransport, type HttpTransportConfig } from "./transports/index";
 export { EmailJobs } from "./jobs/email-jobs";
 export { NotificationJobs } from "./jobs/notification-jobs";
 export { PaymentJobs } from "./jobs/payment-jobs";
+export { WhatsappJobs } from "./jobs/whatsapp-jobs";
 
 // Contracts
 export {
@@ -73,12 +74,17 @@ export {
   type ResetPasswordEmailData,
   // Email event types
   type ResetPasswordEmailEvent,
+  type SendWhatsappTemplateData,
+  type SendWhatsappTemplateEvent,
   type TrialReminderEmailData,
   type TrialReminderEmailEvent,
   type VerificationEmailData,
   type VerificationEmailEvent,
+  type WhatsappEvent,
+  type WhatsappEventName,
   type WithdrawalStatusEmailData,
   type WithdrawalStatusEmailEvent,
+  WHATSAPP_EVENTS,
 } from "./contracts/index";
 
 // Helpers
