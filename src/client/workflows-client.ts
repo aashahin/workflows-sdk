@@ -12,6 +12,15 @@ import type {
 } from "../core/types";
 import { DEFAULT_RETRY_POLICY } from "../helpers/retry";
 
+function isNonRetryableTransportError(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    "nonRetryable" in error &&
+    (error as { nonRetryable?: unknown }).nonRetryable === true
+  );
+}
+
 export class WorkflowsClient {
   private transport: WorkflowTransport;
   private shadowTransport?: WorkflowTransport;
@@ -62,11 +71,19 @@ export class WorkflowsClient {
       if (!this.onSendExhausted) throw error;
 
       const err = error instanceof Error ? error : new Error(String(error));
+      const nonRetryable = isNonRetryableTransportError(error);
 
-      console.error(
-        `[WorkflowsClient] Transport exhausted — persisting ${eventArray.length} event(s) for later retry:`,
-        err.message,
-      );
+      if (nonRetryable) {
+        console.warn(
+          `[WorkflowsClient] Non-retryable transport failure — recording ${eventArray.length} event(s) as dead letter:`,
+          err.message,
+        );
+      } else {
+        console.error(
+          `[WorkflowsClient] Transport exhausted — persisting ${eventArray.length} event(s) for later retry:`,
+          err.message,
+        );
+      }
 
       try {
         await this.onSendExhausted({
