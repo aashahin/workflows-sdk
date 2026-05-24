@@ -1,4 +1,5 @@
 import { DEFAULT_RETRY_POLICY } from "../helpers/retry";
+import { createTraceId, createWorkflowId } from "../core/id";
 import type { WorkflowRegistry } from "../core/registry";
 import type {
   DispatchOptions,
@@ -29,7 +30,7 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown, TServices = u
 ) {
   return class GenericCloudflareWorkflowEntrypoint extends Base {
     async run(
-      event: { payload: WorkflowEventEnvelope },
+      event: { payload: WorkflowEventEnvelope | LegacyWorkflowPayload },
       step: {
         do<T>(
           name: string,
@@ -54,18 +55,19 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown, TServices = u
           ? (config.services as (env: TEnv) => TServices)(env)
           : config.services;
 
-      const workflow = registry.get(event.payload.name);
+      const envelope = normalizeWorkflowEnvelope(event.payload);
+      const workflow = registry.get(envelope.name);
       const payload = registry.parsePayload(
         workflow,
-        event.payload.payload,
+        envelope.payload,
       );
-      await sleepUntilScheduledAt(event.payload, step);
+      await sleepUntilScheduledAt(envelope, step);
 
       return workflow.run(
         {
-          event: event.payload,
-          traceId: event.payload.traceId,
-          idempotencyKey: event.payload.idempotencyKey,
+          event: envelope,
+          traceId: envelope.traceId,
+          idempotencyKey: envelope.idempotencyKey,
           logger: logger ?? console,
           services,
           step<T>(
@@ -101,6 +103,39 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown, TServices = u
         payload,
       );
     }
+  };
+}
+
+export interface LegacyWorkflowPayload {
+  eventId?: string;
+  idempotencyKey?: string;
+  traceId?: string;
+  eventName?: string;
+  data?: WorkflowPayload;
+  delayMs?: number;
+}
+
+function normalizeWorkflowEnvelope(
+  payload: WorkflowEventEnvelope | LegacyWorkflowPayload,
+): WorkflowEventEnvelope {
+  if ("name" in payload && "payload" in payload) return payload;
+
+  const now = new Date();
+  const delayMs =
+    typeof payload.delayMs === "number" && payload.delayMs > 0
+      ? payload.delayMs
+      : undefined;
+
+  return {
+    id: payload.eventId ?? createWorkflowId(),
+    name: payload.eventName ?? "",
+    payload: payload.data ?? {},
+    traceId: payload.traceId ?? createTraceId(),
+    idempotencyKey: payload.idempotencyKey ?? createWorkflowId("idem"),
+    scheduledAt: delayMs
+      ? new Date(now.getTime() + delayMs).toISOString()
+      : undefined,
+    createdAt: now.toISOString(),
   };
 }
 

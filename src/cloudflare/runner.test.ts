@@ -235,4 +235,51 @@ describe("createCloudflareWorkflowEntrypoint", () => {
 
     expect(result).toBe("called:email/send");
   });
+
+  test("accepts legacy eventName/data payloads for rollout compatibility", async () => {
+    const workflow = defineWorkflow("email/send", {
+      async run(ctx, payload) {
+        return {
+          id: ctx.event.id,
+          name: ctx.event.name,
+          payload,
+          traceId: ctx.traceId,
+        };
+      },
+    });
+    class Base {
+      env = {};
+    }
+    const Entrypoint = createCloudflareWorkflowEntrypoint(Base, {
+      registry: defineWorkflowRegistry([workflow]),
+    });
+
+    const result = await new Entrypoint().run(
+      {
+        payload: {
+          eventId: "legacy_1",
+          eventName: "email/send",
+          data: { tenantId: "tenant_1" },
+          traceId: "trace_1",
+          idempotencyKey: "idem_1",
+        },
+      },
+      {
+        do<T>(_name: string, optionsOrFn: unknown, fn?: () => Promise<T> | T): Promise<T> {
+          const operation = (fn ?? optionsOrFn) as () => Promise<T> | T;
+          return Promise.resolve(operation());
+        },
+        sleep() {
+          return Promise.resolve();
+        },
+      },
+    );
+
+    expect(result).toEqual({
+      id: "legacy_1",
+      name: "email/send",
+      payload: { tenantId: "tenant_1" },
+      traceId: "trace_1",
+    });
+  });
 });
