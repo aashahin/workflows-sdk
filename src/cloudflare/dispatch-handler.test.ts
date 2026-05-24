@@ -333,7 +333,7 @@ describe("createCloudflareDispatchHandler", () => {
     expect(created).toHaveLength(2);
   });
 
-  test("reports createBatch items that did not create an instance", async () => {
+  test("treats createBatch-skipped (already existing) instances as idempotent successes", async () => {
     const first = defineWorkflow("first", { run: () => undefined });
     const second = defineWorkflow("second", { run: () => undefined });
     const handler = createCloudflareDispatchHandler({
@@ -343,6 +343,9 @@ describe("createCloudflareDispatchHandler", () => {
           create: async () => {
             throw new Error("create should not be called");
           },
+          // wf_2 already exists, so createBatch idempotently skips it and
+          // excludes it from the result. That is a successful re-dispatch,
+          // not a failure.
           createBatch: async () => [{ id: "wf_1" }],
         };
       },
@@ -376,15 +379,12 @@ describe("createCloudflareDispatchHandler", () => {
     );
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
-      ids: ["wf_1"],
-      errors: [
-        {
-          id: "wf_2",
-          error: "Cloudflare Workflow instance was not created by createBatch",
-        },
-      ],
-    });
+    const body = (await response.json()) as {
+      ids: string[];
+      errors?: unknown[];
+    };
+    expect(body.ids).toEqual(["wf_1", "wf_2"]);
+    expect(body.errors).toBeUndefined();
   });
 
   test("returns per-item errors for malformed dispatch events", async () => {

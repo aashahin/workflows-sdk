@@ -230,36 +230,42 @@ async function createCloudflareWorkflowChunk(
 
   if (binding.createBatch) {
     try {
-      const created = await binding.createBatch(
+      // createBatch throws only when the whole batch fails; on success it has
+      // created every new id and silently skipped any that already exist
+      // (within retention). A skipped id is an idempotent re-dispatch — e.g. a
+      // retry after the worker created the instance but the response was lost —
+      // so the entire batch is accepted, not partially errored.
+      await binding.createBatch(
         envelopes.map((envelope) => ({
           id: envelope.id,
           params: envelope,
         })),
       );
-      const createdIds = getCreatedBatchIds(created);
-      if (createdIds) {
-        const accepted = envelopes.filter((envelope) => createdIds.has(envelope.id));
-        for (const envelope of envelopes) {
-          if (!createdIds.has(envelope.id)) {
-            errors.push({
-              id: envelope.id,
-              error: "Cloudflare Workflow instance was not created by createBatch",
-            });
-          }
-        }
-        return accepted;
-      }
-      if (created.length === envelopes.length) return envelopes;
+      return envelopes;
     } catch {
-      // Fall back to individual creates so one bad instance does not reject the
-      // whole batch response when the platform provides per-instance errors.
+      // Fall back to per-instance creation so one bad instance does not reject
+      // the whole batch response.
     }
   }
 
+  return createCloudflareWorkflowsIndividually(binding, envelopes, errors);
+}
+
+async function createCloudflareWorkflowsIndividually(
+  binding: CloudflareWorkflowBinding,
+  envelopes: WorkflowEventEnvelope[],
+  errors: Array<{ id: string; error: string }>,
+): Promise<WorkflowEventEnvelope[]> {
   const accepted: WorkflowEventEnvelope[] = [];
   for (const envelope of envelopes) {
     try {
-      await createCloudflareWorkflowInstance(binding, envelope);
+      // allowExisting: a duplicate instance id means the event was already
+      // dispatched (e.g. a retried dispatch after the worker created the
+      // instance but the response was lost) and is an idempotent success,
+      // not a failure to retry.
+      await createCloudflareWorkflowInstance(binding, envelope, {
+        allowExisting: true,
+      });
       accepted.push(envelope);
     } catch (error) {
       errors.push({
@@ -515,6 +521,9 @@ async function createCloudflareWorkflowInstance(
   envelope: WorkflowEventEnvelope,
   options: { allowExisting?: boolean } = {},
 ): Promise<boolean> {
+  // createBatch is idempotent (it skips ids that already exist instead of
+  // throwing), so prefer it when re-dispatch must tolerate duplicates. An empty
+  // result means the instance already existed and was skipped.
   if (options.allowExisting && binding.createBatch) {
     const created = await binding.createBatch([{ id: envelope.id, params: envelope }]);
     return created.length > 0;
@@ -527,25 +536,13 @@ async function createCloudflareWorkflowInstance(
     });
     return true;
   } catch (error) {
+    // create() throws on a duplicate id; when re-dispatch is allowed that is an
+    // idempotent no-op (the instance already exists and will run), not an error.
     if (options.allowExisting && isDuplicateCloudflareInstanceError(error)) {
       return false;
     }
     throw error;
   }
-}
-
-function getCreatedBatchIds(created: unknown[]): Set<string> | null {
-  const ids = new Set<string>();
-
-  for (const item of created) {
-    if (typeof item !== "object" || item === null) return null;
-
-    const id = (item as { id?: unknown }).id;
-    if (typeof id !== "string" || id.length === 0) return null;
-    ids.add(id);
-  }
-
-  return ids;
 }
 
 function isMissingCloudflareInstanceError(error: unknown): boolean {
