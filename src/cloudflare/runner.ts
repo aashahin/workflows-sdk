@@ -9,9 +9,10 @@ import type {
   WorkflowStepOptions,
 } from "../core/types";
 
-export interface CloudflareRunnerConfig<TEnv = unknown> {
-  registry: WorkflowRegistry;
+export interface CloudflareRunnerConfig<TEnv = unknown, TServices = unknown> {
+  registry: WorkflowRegistry | ((env: TEnv) => WorkflowRegistry);
   logger?: WorkflowLogger | ((env: TEnv) => WorkflowLogger);
+  services?: TServices | ((env: TEnv) => TServices);
   dispatch?<TPayload extends WorkflowPayload = WorkflowPayload>(
     name: string,
     payload: TPayload,
@@ -20,13 +21,11 @@ export interface CloudflareRunnerConfig<TEnv = unknown> {
   ): Promise<DispatchResult>;
 }
 
-type WorkflowEntrypointConstructor<TEnv> = new () => {
-  env: TEnv;
-};
+type WorkflowEntrypointConstructor = abstract new (...args: any[]) => object;
 
-export function createCloudflareWorkflowEntrypoint<TEnv = unknown>(
-  Base: WorkflowEntrypointConstructor<TEnv>,
-  config: CloudflareRunnerConfig<TEnv>,
+export function createCloudflareWorkflowEntrypoint<TEnv = unknown, TServices = unknown>(
+  Base: WorkflowEntrypointConstructor,
+  config: CloudflareRunnerConfig<TEnv, TServices>,
 ) {
   return class GenericCloudflareWorkflowEntrypoint extends Base {
     async run(
@@ -41,17 +40,25 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown>(
         sleepUntil?(name: string, timestamp: Date | number): Promise<void>;
       },
     ): Promise<unknown> {
+      const env = (this as unknown as { env: TEnv }).env;
       const logger =
         typeof config.logger === "function"
-          ? config.logger(this.env)
+          ? config.logger(env)
           : config.logger;
+      const registry =
+        typeof config.registry === "function"
+          ? config.registry(env)
+          : config.registry;
+      const services =
+        typeof config.services === "function"
+          ? (config.services as (env: TEnv) => TServices)(env)
+          : config.services;
 
-      const workflow = config.registry.get(event.payload.name);
-      const payload = config.registry.parsePayload(
+      const workflow = registry.get(event.payload.name);
+      const payload = registry.parsePayload(
         workflow,
         event.payload.payload,
       );
-      const env = this.env;
       await sleepUntilScheduledAt(event.payload, step);
 
       return workflow.run(
@@ -60,6 +67,7 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown>(
           traceId: event.payload.traceId,
           idempotencyKey: event.payload.idempotencyKey,
           logger: logger ?? console,
+          services,
           step<T>(
             name: string,
             fn: () => Promise<T> | T,

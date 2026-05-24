@@ -121,4 +121,118 @@ describe("createCloudflareDispatchHandler", () => {
       "2026-05-24T09:00:00.000Z",
     );
   });
+
+  test("rejects oversized dispatch requests before parsing JSON", async () => {
+    const workflow = defineWorkflow("email/send", { run: () => undefined });
+    const handler = createCloudflareDispatchHandler({
+      registry: defineWorkflowRegistry([workflow]),
+      maxRequestBytes: 10,
+      resolveWorkflow() {
+        return { create: async () => ({}) };
+      },
+    });
+
+    const response = await handler.fetch(
+      new Request("https://example.com/dispatch", {
+        method: "POST",
+        headers: { "content-length": "11" },
+        body: "{}",
+      }),
+      {},
+    );
+
+    expect(response.status).toBe(413);
+  });
+
+  test("rate limits dispatch requests per isolate", async () => {
+    const workflow = defineWorkflow("email/send", { run: () => undefined });
+    const handler = createCloudflareDispatchHandler({
+      registry: defineWorkflowRegistry([workflow]),
+      rateLimit: { max: 1, windowMs: 60_000 },
+      resolveWorkflow() {
+        return { create: async () => ({}) };
+      },
+    });
+    const body = JSON.stringify({
+      events: [
+        {
+          id: "wf_1",
+          name: "email/send",
+          payload: {},
+          traceId: "trace",
+          idempotencyKey: "idem",
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    });
+
+    const first = await handler.fetch(
+      new Request("https://example.com/dispatch", {
+        method: "POST",
+        body,
+      }),
+      {},
+    );
+    const second = await handler.fetch(
+      new Request("https://example.com/dispatch", {
+        method: "POST",
+        body,
+      }),
+      {},
+    );
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(429);
+  });
+
+  test("dispatch groups events by binding and uses createBatch", async () => {
+    const first = defineWorkflow("first", { run: () => undefined });
+    const second = defineWorkflow("second", { run: () => undefined });
+    const created: unknown[] = [];
+    const binding = {
+      create: async () => {
+        throw new Error("create should not be called");
+      },
+      createBatch: async (batch: unknown[]) => {
+        created.push(...batch);
+        return batch;
+      },
+    };
+    const handler = createCloudflareDispatchHandler({
+      registry: defineWorkflowRegistry([first, second]),
+      resolveWorkflow() {
+        return binding;
+      },
+    });
+
+    const response = await handler.fetch(
+      new Request("https://example.com/dispatch", {
+        method: "POST",
+        body: JSON.stringify({
+          events: [
+            {
+              id: "wf_1",
+              name: "first",
+              payload: {},
+              traceId: "trace_1",
+              idempotencyKey: "idem_1",
+              createdAt: new Date().toISOString(),
+            },
+            {
+              id: "wf_2",
+              name: "second",
+              payload: {},
+              traceId: "trace_2",
+              idempotencyKey: "idem_2",
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        }),
+      }),
+      {},
+    );
+
+    expect(response.status).toBe(200);
+    expect(created).toHaveLength(2);
+  });
 });

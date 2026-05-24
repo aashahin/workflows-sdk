@@ -24,6 +24,13 @@ export interface CloudflareDispatchHandlerConfig<TEnv = unknown> {
   auth?: {
     bearerToken?: string | ((env: TEnv) => string | undefined);
   };
+  maxRequestBytes?: number | false;
+  rateLimit?:
+    | false
+    | {
+        max: number;
+        windowMs: number;
+      };
   resolveWorkflow(
     eventName: string,
     env: TEnv,
@@ -35,6 +42,7 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
   config: CloudflareDispatchHandlerConfig<TEnv>,
 ) {
   const now = config.now ?? (() => new Date());
+  const rateLimiter = createRateLimiter(config.rateLimit);
 
   return {
     async fetch(request: Request, env: TEnv): Promise<Response> {
@@ -66,8 +74,18 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
       }
 
       if (url.pathname === "/dispatch" && request.method === "POST") {
+        const sizeError = verifyRequestSize(request, config.maxRequestBytes);
+        if (sizeError) return sizeError;
+
         const authError = verifyRequestAuth(request, env, config);
         if (authError) return authError;
+
+        if (!rateLimiter()) {
+          return Response.json(
+            { error: "Rate limit exceeded" },
+            { status: 429 },
+          );
+        }
 
         const body = (await request.json().catch(() => null)) as {
           events?: WorkflowEventEnvelope[];
@@ -77,8 +95,11 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
           return Response.json({ error: "Missing events array" }, { status: 400 });
         }
 
-        const instances: WorkflowInstance[] = [];
         const errors: Array<{ id: string; error: string }> = [];
+        const prepared: Array<{
+          envelope: WorkflowEventEnvelope;
+          binding: CloudflareWorkflowBinding;
+        }> = [];
 
         for (const envelope of body.events) {
           try {
@@ -91,18 +112,7 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
               throw new Error(`No Cloudflare Workflow binding for ${envelope.name}`);
             }
 
-            await createCloudflareWorkflowInstance(binding, envelope);
-
-            instances.push({
-              id: envelope.id,
-              name: envelope.name,
-              status: envelope.scheduledAt ? "scheduled" : "queued",
-              traceId: envelope.traceId,
-              idempotencyKey: envelope.idempotencyKey,
-              scheduledAt: envelope.scheduledAt,
-              createdAt: envelope.createdAt,
-              updatedAt: now().toISOString(),
-            });
+            prepared.push({ envelope, binding });
           } catch (error) {
             errors.push({
               id: envelope.id ?? "unknown",
@@ -110,6 +120,18 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
             });
           }
         }
+
+        const accepted = await createCloudflareWorkflowInstances(prepared, errors);
+        const instances = accepted.map((envelope) => ({
+          id: envelope.id,
+          name: envelope.name,
+          status: envelope.scheduledAt ? ("scheduled" as const) : ("queued" as const),
+          traceId: envelope.traceId,
+          idempotencyKey: envelope.idempotencyKey,
+          scheduledAt: envelope.scheduledAt,
+          createdAt: envelope.createdAt,
+          updatedAt: now().toISOString(),
+        }));
 
         return Response.json({
           ids: instances.map((instance) => instance.id),
@@ -156,6 +178,118 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
 
       return { dispatched };
     },
+  };
+}
+
+async function createCloudflareWorkflowInstances(
+  events: Array<{
+    envelope: WorkflowEventEnvelope;
+    binding: CloudflareWorkflowBinding;
+  }>,
+  errors: Array<{ id: string; error: string }>,
+): Promise<WorkflowEventEnvelope[]> {
+  const accepted: WorkflowEventEnvelope[] = [];
+  const groups = new Map<
+    CloudflareWorkflowBinding,
+    WorkflowEventEnvelope[]
+  >();
+
+  for (const event of events) {
+    const group = groups.get(event.binding);
+    if (group) {
+      group.push(event.envelope);
+    } else {
+      groups.set(event.binding, [event.envelope]);
+    }
+  }
+
+  for (const [binding, group] of groups) {
+    for (const chunk of chunkEnvelopes(group, 100)) {
+      accepted.push(...(await createCloudflareWorkflowChunk(binding, chunk, errors)));
+    }
+  }
+
+  return accepted;
+}
+
+async function createCloudflareWorkflowChunk(
+  binding: CloudflareWorkflowBinding,
+  envelopes: WorkflowEventEnvelope[],
+  errors: Array<{ id: string; error: string }>,
+): Promise<WorkflowEventEnvelope[]> {
+  if (envelopes.length === 0) return [];
+
+  if (binding.createBatch) {
+    try {
+      await binding.createBatch(
+        envelopes.map((envelope) => ({
+          id: envelope.id,
+          params: envelope,
+        })),
+      );
+      return envelopes;
+    } catch {
+      // Fall back to individual creates so one bad instance does not reject the
+      // whole batch response when the platform provides per-instance errors.
+    }
+  }
+
+  const accepted: WorkflowEventEnvelope[] = [];
+  for (const envelope of envelopes) {
+    try {
+      await createCloudflareWorkflowInstance(binding, envelope);
+      accepted.push(envelope);
+    } catch (error) {
+      errors.push({
+        id: envelope.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return accepted;
+}
+
+function chunkEnvelopes<T>(envelopes: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < envelopes.length; index += size) {
+    chunks.push(envelopes.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function verifyRequestSize(
+  request: Request,
+  maxRequestBytes: number | false | undefined,
+): Response | null {
+  if (maxRequestBytes === false) return null;
+
+  const maxBytes = maxRequestBytes ?? 1_048_576;
+  const contentLength = request.headers.get("content-length");
+  if (contentLength && Number(contentLength) > maxBytes) {
+    return Response.json({ error: "Payload too large" }, { status: 413 });
+  }
+
+  return null;
+}
+
+function createRateLimiter(
+  rateLimit: CloudflareDispatchHandlerConfig["rateLimit"],
+): () => boolean {
+  if (!rateLimit) return () => true;
+
+  let count = 0;
+  let windowStart = Date.now();
+
+  return () => {
+    const now = Date.now();
+    if (now - windowStart > rateLimit.windowMs) {
+      count = 0;
+      windowStart = now;
+    }
+
+    count += 1;
+    return count <= rateLimit.max;
   };
 }
 

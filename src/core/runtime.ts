@@ -13,20 +13,21 @@ import type {
 } from "./types";
 import { WorkflowClient } from "./client";
 
-export interface WorkflowRuntimeOptions {
+export interface WorkflowRuntimeOptions<TServices = unknown> {
   registry: WorkflowRegistry;
   client?: WorkflowClient;
   clientConfig?: WorkflowClientConfig;
   logger?: WorkflowLogger;
+  services?: TServices;
   sleep?: (ms: number) => Promise<void>;
   getStepResult?: (instanceId: string, stepName: string) => Promise<unknown | undefined>;
   hasStepResult?: (instanceId: string, stepName: string) => Promise<boolean>;
   saveStepResult?: (instanceId: string, stepName: string, result: unknown) => Promise<void>;
 }
 
-export async function runWorkflowEnvelope(
+export async function runWorkflowEnvelope<TServices = unknown>(
   envelope: WorkflowEventEnvelope,
-  options: WorkflowRuntimeOptions,
+  options: WorkflowRuntimeOptions<TServices>,
 ): Promise<unknown> {
   const workflow = options.registry.get(envelope.name);
   const payload = options.registry.parsePayload(
@@ -42,12 +43,12 @@ export async function runWorkflowEnvelope(
   return workflow.run(ctx, payload);
 }
 
-export function createRunContext(
+export function createRunContext<TServices = unknown>(
   envelope: WorkflowEventEnvelope,
-  workflow: RegisteredWorkflow,
-  options: WorkflowRuntimeOptions,
+  workflow: RegisteredWorkflow<WorkflowPayload, unknown, TServices>,
+  options: WorkflowRuntimeOptions<TServices>,
   client?: WorkflowClient,
-): WorkflowRunContext {
+): WorkflowRunContext<TServices> {
   const logger = options.logger ?? consoleLogger;
   const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
 
@@ -56,6 +57,7 @@ export function createRunContext(
     traceId: envelope.traceId,
     idempotencyKey: envelope.idempotencyKey,
     logger,
+    services: options.services as TServices,
     async step<T>(
       name: string,
       fn: () => Promise<T> | T,

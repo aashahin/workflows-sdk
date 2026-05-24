@@ -181,4 +181,58 @@ describe("createCloudflareWorkflowEntrypoint", () => {
       },
     });
   });
+
+  test("injects runtime services into workflow context", async () => {
+    interface Services {
+      backend: {
+        call(path: string): Promise<string>;
+      };
+    }
+
+    const workflow = defineWorkflow<
+      "email/send",
+      Record<string, unknown>,
+      string,
+      Services
+    >("email/send", {
+      async run(ctx) {
+        return ctx.services.backend.call("email/send");
+      },
+    });
+    class Base {
+      env = {};
+    }
+    const Entrypoint = createCloudflareWorkflowEntrypoint(Base, {
+      registry: defineWorkflowRegistry([workflow]),
+      services: {
+        backend: {
+          call: async (path: string) => `called:${path}`,
+        },
+      },
+    });
+
+    const result = await new Entrypoint().run(
+      {
+        payload: {
+          id: "wf_1",
+          name: "email/send",
+          payload: {},
+          traceId: "trace",
+          idempotencyKey: "idem",
+          createdAt: new Date().toISOString(),
+        },
+      },
+      {
+        do<T>(_name: string, optionsOrFn: unknown, fn?: () => Promise<T> | T): Promise<T> {
+          const operation = (fn ?? optionsOrFn) as () => Promise<T> | T;
+          return Promise.resolve(operation());
+        },
+        sleep() {
+          return Promise.resolve();
+        },
+      },
+    );
+
+    expect(result).toBe("called:email/send");
+  });
 });

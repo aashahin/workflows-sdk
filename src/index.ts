@@ -1,6 +1,7 @@
 export { WorkflowClient, createWorkflowClient } from "./core/client";
 export { defineWorkflow } from "./core/definition";
 export { defineWorkflowRegistry, parseWorkflowPayload } from "./core/registry";
+export type { WorkflowRegistry } from "./core/registry";
 export {
   createRunContext,
   durationToMs,
