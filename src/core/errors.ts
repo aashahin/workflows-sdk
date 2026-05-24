@@ -40,3 +40,19 @@ export class WorkflowRetryExhaustedError extends WorkflowError {
     this.attempts = attempts;
   }
 }
+
+/** Workflow definition is missing from the configured registry. */
+export class WorkflowNotFoundError extends WorkflowError {
+  constructor(name: string) {
+    super(`Workflow "${name}" is not registered`, "WORKFLOW_NOT_FOUND");
+    this.name = "WorkflowNotFoundError";
+  }
+}
+
+/** A workflow was claimed by another runtime instance. */
+export class WorkflowAlreadyClaimedError extends WorkflowError {
+  constructor(message: string) {
+    super(message, "WORKFLOW_ALREADY_CLAIMED");
+    this.name = "WorkflowAlreadyClaimedError";
+  }
+}

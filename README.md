@@ -1,454 +1,429 @@
 # @abshahin/workflows-sdk
 
-TypeScript SDK for dispatching typed background workflow events to a Cloudflare Worker runtime.
+Runtime-neutral TypeScript workflow definitions with adapters for Bun and Cloudflare Workflows.
 
-The package is transport-oriented and framework-agnostic. It provides a client, an HTTP transport, strongly typed event contracts, retry utilities, and job facades for email, notification, and payment workflows.
+The SDK gives you one typed workflow contract:
 
-It also provides a dedicated WhatsApp workflow facade for asynchronous template-message dispatch.
-
-Related worker runtime: `https://github.com/aashahin/cloudflare-workflows-worker`
-
-## Why this package exists
-
-`@abshahin/workflows-sdk` separates event production from workflow execution.
-
-- Producers only need to know how to send typed events
-- The transport layer decides how those events reach the workflow runtime
-- Event names and payloads stay typed across package boundaries
-- Existing application code can migrate away from Inngest-style producers with minimal surface change
-- The default companion runtime for this SDK is the Workflows Worker: `https://github.com/aashahin/cloudflare-workflows-worker`
-
-## Features
-
-- Typed contracts for email, notification, and payment events
-- Typed contracts for WhatsApp template-send events
-- HTTP transport for dispatching event batches to a worker endpoint
-- Producer-friendly job facades: `EmailJobs`, `NotificationJobs`, `PaymentJobs`, `WhatsappJobs`
-- Transport retry support with exponential backoff
-- Optional dual-run mode for phased migrations
-- Optional `onSendExhausted` hook for persisting failed transport attempts
-- Sub-path exports for contracts and helpers
+- Define workflows once with `defineWorkflow()`.
+- Dispatch standard envelopes with `createWorkflowClient()`.
+- Run the same workflow definitions on Bun, a custom Cloudflare Worker endpoint, or Cloudflare's public Workflows REST API.
+- Persist idempotency, cron claims, workflow state, step results, retries, and dead letters through runtime adapters.
 
 ## Installation
 
-Inside this monorepo:
+Inside this monorepo the package is consumed as a workspace package:
 
 ```json
 "@abshahin/workflows-sdk": "workspace:*"
 ```
 
-Once published publicly, install it with your package manager of choice:
+The package currently exports TypeScript source files directly and is intended for Bun/workspace usage. If it is published outside this monorepo, add a build step first or make sure the consuming runtime can load TypeScript subpath exports.
 
-```bash
-bun add @abshahin/workflows-sdk
-```
+## Exports
 
-```bash
-npm install @abshahin/workflows-sdk
-```
+| Import path | Purpose |
+| --- | --- |
+| `@abshahin/workflows-sdk` | Core workflow definition, registry, client, envelope, scheduler, and error types |
+| `@abshahin/workflows-sdk/http` | `SignedHttpAdapter` for a custom worker endpoint with `/dispatch` and `/status/:id` |
+| `@abshahin/workflows-sdk/cloudflare` | Cloudflare Worker dispatch handler, Workflow entrypoint helper, and REST API adapter |
+| `@abshahin/workflows-sdk/bun` | Bun runtime plus SQLite and Redis adapters |
+| `@abshahin/workflows-sdk/scheduler` | Cron helpers and cron definition types |
+| `@abshahin/workflows-sdk/testing` | In-memory adapter for tests |
 
-## Quick start
+## Core API
 
-```typescript
+Define workflow logic with a name, optional schema, optional cron definitions, optional retry/timeout defaults, and a `run()` function.
+
+```ts
 import {
-  EmailJobs,
-  HttpTransport,
-  NotificationJobs,
-  PaymentJobs,
-  WhatsappJobs,
-  createWorkflowsClient,
+  createWorkflowClient,
+  defineWorkflow,
+  defineWorkflowRegistry,
 } from "@abshahin/workflows-sdk";
+import { SignedHttpAdapter } from "@abshahin/workflows-sdk/http";
 
-const client = createWorkflowsClient({
-  transport: new HttpTransport({
+const sendEmail = defineWorkflow("email/send", {
+  cron: [
+    {
+      name: "daily-digest",
+      schedule: "0 9 * * *",
+      payload: { kind: "daily-digest" },
+    },
+  ],
+  retry: {
+    maxAttempts: 3,
+    initialIntervalMs: 1_000,
+    multiplier: 2,
+    maxIntervalMs: 30_000,
+  },
+  async run(ctx, payload) {
+    await ctx.step("send", async () => {
+      console.log("send email", payload);
+    });
+  },
+});
+
+export const registry = defineWorkflowRegistry([sendEmail]);
+
+const client = createWorkflowClient({
+  adapter: new SignedHttpAdapter({
     baseUrl: "https://workflows.example.com",
     authToken: process.env.WORKFLOWS_AUTH_TOKEN!,
   }),
 });
 
-const emailJobs = new EmailJobs(client, () => true);
-const notificationJobs = new NotificationJobs(client);
-const paymentJobs = new PaymentJobs(client);
-const whatsappJobs = new WhatsappJobs(client);
+await client.dispatch("email/send", { tenantId: "tenant_123" });
+```
 
-await emailJobs.sendResetPasswordEmail({
-  email: "user@example.com",
-  userName: "John",
-  otpCode: "123456",
-  tenantId: "tenant_123",
+### Dispatch Options
+
+`client.dispatch(name, payload, options)` accepts:
+
+| Option | Meaning |
+| --- | --- |
+| `id` | Explicit workflow instance ID |
+| `idempotencyKey` | Deduplication key used by adapters that support idempotency |
+| `delayMs` | Relative delay before the workflow should run |
+| `scheduledAt` | Absolute ISO string or `Date` for delayed execution |
+| `traceId` | Trace/correlation ID |
+| `metadata` | Extra envelope metadata |
+
+Delayed envelopes are stored as `scheduled` by Bun adapters. Cloudflare runner helpers sleep inside the Workflow before running user code.
+
+### Run Context
+
+Every workflow receives a `ctx` object:
+
+| Method/property | Purpose |
+| --- | --- |
+| `ctx.step(name, fn, options?)` | Runs a durable/idempotent step when the adapter/runtime supports step storage |
+| `ctx.sleep(name, durationOrDate)` | Sleeps by duration string, milliseconds, or until a `Date` |
+| `ctx.dispatch(name, payload, options?)` | Dispatches another workflow through the configured client |
+| `ctx.event` | Original workflow envelope |
+| `ctx.traceId` | Trace ID from the envelope |
+| `ctx.idempotencyKey` | Idempotency key from the envelope |
+| `ctx.logger` | Runtime logger |
+
+Step results are cached by step name and workflow instance ID. Reusing the same step name for different side effects inside one workflow instance will reuse the first stored result.
+
+## Bun Runtime
+
+Use the Bun runtime when you want to execute workflows in a Bun process.
+
+```ts
+import {
+  BunSqliteWorkflowAdapter,
+  createBunWorkflowRuntime,
+} from "@abshahin/workflows-sdk/bun";
+import { registry } from "./workflows";
+
+const runtime = createBunWorkflowRuntime({
+  registry,
+  adapter: new BunSqliteWorkflowAdapter({ path: "workflows.sqlite" }),
+  concurrency: 4,
+  scheduler: {
+    mode: "external",
+  },
 });
 
-await notificationJobs.addNotification(
-  "tenant_123",
-  "user_456",
-  {
-    title: "New course available",
-    message: "Check the dashboard for details.",
-    type: "info",
+await runtime.client.dispatch("email/send", { tenantId: "tenant_123" });
+await runtime.tick();
+await runtime.processReady();
+```
+
+### SQLite Adapter
+
+`BunSqliteWorkflowAdapter` is the recommended single-server adapter. It stores:
+
+- workflow instances
+- scheduled and queued state
+- idempotency keys
+- cron run claims
+- step results, including `undefined` results
+- dead letters
+
+```ts
+import { BunSqliteWorkflowAdapter } from "@abshahin/workflows-sdk/bun";
+
+const adapter = new BunSqliteWorkflowAdapter({
+  path: "workflows.sqlite",
+  namespace: "production",
+});
+```
+
+### Redis Adapter
+
+`BunRedisWorkflowAdapter` is intended for multi-instance Bun deployments. It uses Redis sorted sets, leases, idempotency keys, and step-result hashes.
+
+```ts
+import { BunRedisWorkflowAdapter } from "@abshahin/workflows-sdk/bun";
+
+const adapter = new BunRedisWorkflowAdapter({
+  url: Bun.env.REDIS_URL,
+  namespace: "workflows",
+  leaseTtlMs: 30_000,
+});
+```
+
+You can also pass an existing Redis-like client:
+
+```ts
+const adapter = new BunRedisWorkflowAdapter({
+  client: myRedisClient,
+});
+```
+
+The adapter uses Bun's `RedisClient` when available. Raw Redis commands are sent through `redis.send(command, stringArgs)`.
+
+### Scheduler Modes
+
+| Mode | Use case | Behavior |
+| --- | --- | --- |
+| `external` | Kubernetes CronJob, systemd timer, queue worker, tests | You call `runtime.tick()` and/or `runtime.processReady()` yourself |
+| `in-process` | Long-running Bun process | Registers `Bun.cron(schedule, handler)` and processes due work in the same process |
+| `os` | Single-server production cron | Registers `Bun.cron(path, schedule, title)` and expects the target module to export `scheduled()` |
+| `redis` | Multi-instance Bun deployment | Uses Bun cron as a wake-up mechanism and Redis for claims/leases |
+
+For OS-level Bun cron, register cron jobs from the long-running app:
+
+```ts
+const runtime = createBunWorkflowRuntime({
+  registry,
+  adapter,
+  scheduler: {
+    mode: "os",
+    scriptPath: import.meta.path,
+    titlePrefix: "my-app-workflows",
   },
-  { delay: 5_000 },
+});
+
+runtime.start();
+```
+
+The target module must export Bun's scheduled handler:
+
+```ts
+import {
+  BunSqliteWorkflowAdapter,
+  createBunWorkflowScheduledHandler,
+} from "@abshahin/workflows-sdk/bun";
+import { registry } from "./workflows";
+
+export default createBunWorkflowScheduledHandler({
+  registry,
+  adapter: new BunSqliteWorkflowAdapter({ path: "workflows.sqlite" }),
+  scheduler: {
+    mode: "os",
+  },
+});
+```
+
+Bun cron uses standard 5-field cron expressions. Bun parses and runs in-process cron schedules in UTC. OS-level Bun cron follows the host timezone because it delegates to the platform scheduler. The SDK accounts for that in `scheduled()` by evaluating OS cron ticks in the local timezone unless a cron definition sets `timezone`.
+
+### Cron Idempotency
+
+Cron runs use deterministic keys:
+
+```txt
+${workflowName}:${cronName}:${scheduledAt.toISOString()}
+```
+
+SQLite or Redis stores the run key before dispatch, so duplicate wake-ups do not create duplicate workflow instances.
+
+`missedRunPolicy` defaults to `skip`. Use catch-up mode when you explicitly want multiple missed runs:
+
+```ts
+const workflow = defineWorkflow("billing/hourly", {
+  cron: [
+    {
+      name: "hourly",
+      schedule: "0 * * * *",
+      missedRunPolicy: { mode: "catch-up-all", maxRuns: 3 },
+    },
+  ],
+  run: async () => {},
+});
+```
+
+### Bun Retries and Recovery
+
+The Bun runtime retries failed workflow runs when the workflow has a retry policy and the adapter implements `requeue()`.
+
+- Step-level retry happens inside `ctx.step()`.
+- Workflow-level retry requeues the same instance with attempt metadata.
+- If retries are exhausted, the instance is marked `dead` and recorded as a dead letter when the adapter supports it.
+- `recoverStalled()` returns stuck `running` instances to `queued` or `scheduled`.
+
+## Cloudflare Workflows
+
+There are two Cloudflare integration paths.
+
+### Custom Worker Endpoint
+
+Use `SignedHttpAdapter` from an app/backend that dispatches to your own Worker endpoint:
+
+```ts
+import { createWorkflowClient } from "@abshahin/workflows-sdk";
+import { SignedHttpAdapter } from "@abshahin/workflows-sdk/http";
+
+const client = createWorkflowClient({
+  adapter: new SignedHttpAdapter({
+    baseUrl: "https://workflows.worker.example.com",
+    authToken: Bun.env.WORKFLOWS_AUTH_TOKEN!,
+  }),
+});
+
+await client.dispatch("email/send", { tenantId: "tenant_123" });
+await client.getInstance("wf_123", { name: "email/send" });
+```
+
+The custom Worker endpoint must expose:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /dispatch` | Accepts `{ events: WorkflowEventEnvelope[] }` and creates Workflow instances |
+| `GET /status/:id?name=<eventName>` | Returns the instance status |
+| `GET /health` | Optional health check |
+
+You can build that Worker with `createCloudflareDispatchHandler()`:
+
+```ts
+import { createCloudflareDispatchHandler } from "@abshahin/workflows-sdk/cloudflare";
+import { registry } from "./workflows";
+
+export default createCloudflareDispatchHandler({
+  registry,
+  auth: {
+    bearerToken: (env: { AUTH_TOKEN: string }) => env.AUTH_TOKEN,
+  },
+  resolveWorkflow(eventName, env: { EMAIL_WORKFLOW: Workflow }) {
+    if (eventName.startsWith("email/")) return env.EMAIL_WORKFLOW;
+    return null;
+  },
+});
+```
+
+The handler calls the Cloudflare binding with `Workflow.create({ id, params })`. Scheduled envelopes are passed as params and delayed by the Workflow entrypoint helper.
+
+### Workflow Entrypoint Helper
+
+Use `createCloudflareWorkflowEntrypoint()` when you want Cloudflare Workflows to execute SDK workflow definitions directly.
+
+```ts
+import { WorkflowEntrypoint } from "cloudflare:workers";
+import { createCloudflareWorkflowEntrypoint } from "@abshahin/workflows-sdk/cloudflare";
+import { registry } from "./workflows";
+
+interface Env {
+  AUTH_TOKEN: string;
+}
+
+const EmailWorkflowBase = createCloudflareWorkflowEntrypoint(
+  WorkflowEntrypoint<Env>,
+  { registry },
 );
 
-await paymentJobs.processPayout({
-  tenantId: "tenant_123",
-  transactionId: "txn_001",
-  walletId: "wallet_001",
-  amount: 250,
-  currency: "USD",
-});
-
-await whatsappJobs.sendTemplateMessage({
-  tenantId: "tenant_123",
-  recipientPhone: "+15551234567",
-  templateKey: "order_confirmed",
-  triggerEvent: "order.completed",
-  variables: {
-    customer_name: "John",
-    course_name: "Arabic 101",
-    access_link: "https://tenant.example.com/dashboard",
-  },
-  customerId: "customer_789",
-});
+export class EmailWorkflow extends EmailWorkflowBase {}
 ```
 
-## How it fits together
+The helper maps:
 
-```mermaid
-flowchart LR
-  A[Application code] --> B[Job facade]
-  B --> C[WorkflowsClient]
-  C --> D[Transport]
-  D --> E[Worker /dispatch endpoint]
-  E --> F[Workflow runtime]
-```
+- `ctx.step()` to `step.do()`
+- `ctx.sleep()` to `step.sleep()` or `step.sleepUntil()`
+- workflow retry/timeout options to Cloudflare step config
+- future `scheduledAt` envelopes to a durable Cloudflare sleep before user code runs
 
-## Core API
+### Direct Cloudflare REST API
 
-### `createWorkflowsClient`
+Use `CloudflareRestWorkflowAdapter` when you want to dispatch directly to Cloudflare's public Workflows REST API instead of your own Worker endpoint.
 
-Creates a `WorkflowsClient` from a transport configuration.
+```ts
+import { createWorkflowClient } from "@abshahin/workflows-sdk";
+import { CloudflareRestWorkflowAdapter } from "@abshahin/workflows-sdk/cloudflare";
 
-Use it when you want a minimal factory instead of constructing the client class directly.
-
-### `HttpTransport`
-
-Sends one or more workflow events to the worker's `/dispatch` endpoint.
-
-Config:
-
-- `baseUrl`: worker base URL
-- `authToken`: shared bearer token
-- `timeoutMs`: request timeout, default `10000`
-- `retry`: retry policy, or `false` to disable transport retries
-
-Transport behavior:
-
-- Trims trailing slashes from `baseUrl`
-- Wraps network/timeouts as `WorkflowSendError`
-- Treats `429` and all `5xx` responses as retryable
-- Treats other `4xx` responses as non-retryable transport failures
-- Logs partial batch failures without throwing away successful IDs
-
-### `EmailJobs`
-
-Facade for email-related workflow events.
-
-Notable methods:
-
-- `sendResetPasswordEmail`
-- `sendVerificationEmail`
-- `sendChangeEmailVerification`
-- `sendNewAccountCredentials`
-- `sendInvitationEmail`
-- `sendEnrollmentConfirmationEmail`
-- `sendCartRecoveryEmail`
-- `sendTrialEndingReminder`
-- `sendPaymentReceiptEmail`
-- `sendWithdrawalStatusEmail`
-- `sendFailedPaymentAlertEmail`
-- `sendRefundConfirmationEmail`
-
-The constructor accepts an optional `isEnabled` callback to short-circuit email dispatch when email delivery is disabled.
-
-### `NotificationJobs`
-
-Facade for notification-related workflow events.
-
-Notable methods:
-
-- `addNotification`
-- `addNotificationForCustomer`
-- `addBulkNotification`
-- `addMultipleNotifications`
-
-`addMultipleNotifications` preserves per-item delays by sending individual events only when needed; otherwise it batches them.
-
-### `PaymentJobs`
-
-Facade for payment-related workflow events.
-
-Current method:
-
-- `processPayout`
-
-This dispatches the payout orchestration workflow handled by the worker runtime.
-
-### `WhatsappJobs`
-
-Facade for WhatsApp-related workflow events.
-
-Current method:
-
-- `sendTemplateMessage`
-
-This dispatches an asynchronous template-message send that the backend executes through its WhatsApp delivery service.
-
-## Usage examples
-
-### Email workflow dispatch
-
-```typescript
-import {
-  EmailJobs,
-  HttpTransport,
-  createWorkflowsClient,
-} from "@abshahin/workflows-sdk";
-
-const client = createWorkflowsClient({
-  transport: new HttpTransport({
-    baseUrl: "https://workflows.example.com",
-    authToken: "secret",
+const client = createWorkflowClient({
+  adapter: new CloudflareRestWorkflowAdapter({
+    accountId: Bun.env.CLOUDFLARE_ACCOUNT_ID!,
+    apiToken: Bun.env.CLOUDFLARE_API_TOKEN!,
+    workflowName(eventName) {
+      if (eventName.startsWith("email/")) return "manhali-email-workflow";
+      throw new Error(`No Cloudflare Workflow for ${eventName}`);
+    },
   }),
 });
 
-const emailJobs = new EmailJobs(client, () => true);
-
-await emailJobs.sendVerificationEmail(
-  {
-    email: "user@example.com",
-    otpCode: "123456",
-    tenantId: "tenant_123",
-  },
-  { delay: 5_000 },
-);
+await client.dispatch("email/send", { tenantId: "tenant_123" });
+await client.getInstance("wf_123", { name: "email/send" });
 ```
 
-### Notification workflow dispatch
+The adapter posts:
 
-```typescript
-import {
-  HttpTransport,
-  NotificationJobs,
-  createWorkflowsClient,
-} from "@abshahin/workflows-sdk";
-
-const client = createWorkflowsClient({
-  transport: new HttpTransport({
-    baseUrl: "https://workflows.example.com",
-    authToken: "secret",
-  }),
-});
-
-const notificationJobs = new NotificationJobs(client);
-
-await notificationJobs.addBulkNotification(
-  "tenant_123",
-  {
-    title: "Billing update",
-    message: "Your subscription has been renewed.",
-    type: "billing",
-  },
-  ["user_1", "user_2"],
-);
+```json
+{
+  "instance_id": "wf_123",
+  "params": {
+    "id": "wf_123",
+    "name": "email/send",
+    "payload": {}
+  }
+}
 ```
 
-### Payment workflow dispatch
+to:
 
-```typescript
-import {
-  HttpTransport,
-  PaymentJobs,
-  createWorkflowsClient,
-} from "@abshahin/workflows-sdk";
-
-const client = createWorkflowsClient({
-  transport: new HttpTransport({
-    baseUrl: "https://workflows.example.com",
-    authToken: "secret",
-  }),
-});
-
-const paymentJobs = new PaymentJobs(client);
-
-await paymentJobs.processPayout({
-  tenantId: "tenant_123",
-  transactionId: "txn_001",
-  walletId: "wallet_001",
-  amount: 250,
-  currency: "USD",
-});
+```txt
+/accounts/{account_id}/workflows/{workflow_name}/instances
 ```
 
-### WhatsApp workflow dispatch
+Status lookup requires either a prior dispatch through the same adapter instance or `getInstance(id, { name })`, because Cloudflare status endpoints are scoped to a workflow name.
 
-```typescript
-import {
-  HttpTransport,
-  WhatsappJobs,
-  createWorkflowsClient,
-} from "@abshahin/workflows-sdk";
+## Testing
 
-const client = createWorkflowsClient({
-  transport: new HttpTransport({
-    baseUrl: "https://workflows.example.com",
-    authToken: "secret",
-  }),
-});
+Use `InMemoryWorkflowAdapter` for unit tests:
 
-const whatsappJobs = new WhatsappJobs(client);
+```ts
+import { createWorkflowClient } from "@abshahin/workflows-sdk";
+import { InMemoryWorkflowAdapter } from "@abshahin/workflows-sdk/testing";
 
-await whatsappJobs.sendTemplateMessage({
-  tenantId: "tenant_123",
-  recipientPhone: "+15551234567",
-  templateKey: "welcome_student",
-  triggerEvent: "enrollment.created",
-  variables: {
-    student_name: "John",
-    course_name: "Arabic 101",
-    start_link: "https://tenant.example.com/course/intro/learn",
-  },
-});
+const adapter = new InMemoryWorkflowAdapter();
+const client = createWorkflowClient({ adapter });
+
+await client.dispatch("email/send", { tenantId: "tenant_123" });
 ```
 
-## Advanced patterns
+For runtime-level tests, use `BunSqliteWorkflowAdapter({ path: ":memory:" })`.
 
-### Dual-run mode
+## Error Classes
 
-Use dual-run mode when migrating between workflow backends or validating a new transport.
+The root export includes:
 
-```typescript
-import { HttpTransport, createWorkflowsClient } from "@abshahin/workflows-sdk";
+- `WorkflowError`
+- `WorkflowSendError`
+- `WorkflowValidationError`
+- `WorkflowRetryExhaustedError`
+- `WorkflowNotFoundError`
+- `WorkflowAlreadyClaimedError`
 
-const primaryTransport = new HttpTransport({
-  baseUrl: "https://primary.example.com",
-  authToken: "primary-secret",
-});
+`SignedHttpAdapter` marks most non-429 `4xx` responses as non-retryable by setting `error.nonRetryable = true`.
 
-const shadowTransport = new HttpTransport({
-  baseUrl: "https://shadow.example.com",
-  authToken: "shadow-secret",
-});
+## Production Notes
 
-const client = createWorkflowsClient({
-  transport: primaryTransport,
-  shadowTransport,
-  dualRun: true,
-});
+- Use Cloudflare Workflows for Worker deployments that need managed durable execution.
+- Use SQLite for one Bun process/server.
+- Use Redis for multiple Bun workers or multiple scheduler instances.
+- Keep workflow instance IDs under Cloudflare's current instance ID limit when using the REST adapter.
+- Keep workflow names under Cloudflare's current workflow name limit when using the REST adapter.
+- Use unique, stable step names. Step results are keyed by instance ID and step name.
+- Do not rely on Bun's fallback cron parser for production semantics. Production Bun scheduling should use Bun's native cron support.
+- In-process Bun cron uses UTC. OS-level Bun cron uses the host timezone.
+- `Bun.cron(path, schedule, title)` re-registers the same title in place, so keep `titlePrefix`, workflow name, and cron name stable.
+- This package currently ships TypeScript source via exports; compile before publishing to runtimes that cannot load TypeScript directly.
+
+## Verification
+
+Useful package-level checks:
+
+```bash
+bun test packages/workflows-sdk/src
+bunx tsc -p packages/workflows-sdk/tsconfig.json --noEmit
 ```
-
-The primary transport result is returned. Shadow transport failures are logged and suppressed.
-
-### Persist exhausted transport failures
-
-Use `onSendExhausted` when you want to store failed dispatches for later replay instead of letting producer-side business logic fail immediately.
-
-```typescript
-import { HttpTransport, createWorkflowsClient } from "@abshahin/workflows-sdk";
-
-const client = createWorkflowsClient({
-  transport: new HttpTransport({
-    baseUrl: "https://workflows.example.com",
-    authToken: "secret",
-  }),
-  onSendExhausted: async ({ events, options, error, attempts }) => {
-    console.error("Persist failed workflow dispatch", {
-      attempts,
-      error: error.message,
-      eventCount: events.length,
-      traceId: options?.traceId,
-    });
-  },
-});
-```
-
-When persistence succeeds, the client returns `{ ids: [] }` instead of throwing.
-
-## Event domains
-
-### Email events
-
-- `email/reset-password`
-- `email/new-account-credentials`
-- `email/change-email-verification`
-- `email/verification`
-- `email/cart-recovery`
-- `email/invitation`
-- `email/enrollment-confirmation`
-- `email/trial-reminder`
-- `email/payment-receipt`
-- `email/withdrawal-status`
-- `email/failed-payment-alert`
-- `email/refund-confirmation`
-
-### Notification events
-
-- `notification/create`
-- `notification/create-for-customer`
-- `notification/bulk-create`
-
-### Payment events
-
-- `payment/process-payout`
-
-### WhatsApp events
-
-- `whatsapp/send-template`
-
-## Exports
-
-| Export                                                                                            | Description                   |
-| ------------------------------------------------------------------------------------------------- | ----------------------------- |
-| `createWorkflowsClient`                                                                           | Factory for `WorkflowsClient` |
-| `WorkflowsClient`                                                                                 | Core dispatch client          |
-| `HttpTransport`                                                                                   | HTTP transport adapter        |
-| `EmailJobs`                                                                                       | Email job facade              |
-| `NotificationJobs`                                                                                | Notification job facade       |
-| `PaymentJobs`                                                                                     | Payment job facade            |
-| `WhatsappJobs`                                                                                    | WhatsApp job facade           |
-| `EMAIL_EVENTS` / `NOTIFICATION_EVENTS` / `PAYMENT_EVENTS`                                         | Event name constants          |
-| `WHATSAPP_EVENTS`                                                                                 | WhatsApp event constants      |
-| `withRetry` / `getBackoffDelay` / `DEFAULT_RETRY_POLICY`                                          | Retry helpers                 |
-| `deriveIdempotencyKey` / `generateEventId`                                                        | Idempotency helpers           |
-| `WorkflowError` / `WorkflowSendError` / `WorkflowValidationError` / `WorkflowRetryExhaustedError` | Typed errors                  |
-
-## Sub-path exports
-
-The SDK exposes sub-path imports for tree-shaking or isolated usage:
-
-```typescript
-import {
-  EMAIL_EVENTS,
-  type ResetPasswordEmailData,
-} from "@abshahin/workflows-sdk/contracts";
-import {
-  deriveIdempotencyKey,
-  withRetry,
-} from "@abshahin/workflows-sdk/helpers";
-```
-
-## Migration from Inngest
-
-The job facades are designed to make migration straightforward, but there is one important API difference.
-
-Previous Inngest usage relied on static methods:
-
-```diff
-- EmailJobs.sendResetPasswordEmail(data);
-+ emailJobs.sendResetPasswordEmail(data);
-```
-
-The SDK uses instance-based facades so transports, feature flags, and fallback behavior can be injected once at application bootstrap.
-
-## License
-
-MIT. Add the `LICENSE` file in the published `workflows-sdk` repository.
