@@ -74,9 +74,6 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
       }
 
       if (url.pathname === "/dispatch" && request.method === "POST") {
-        const sizeError = verifyRequestSize(request, config.maxRequestBytes);
-        if (sizeError) return sizeError;
-
         const authError = verifyRequestAuth(request, env, config);
         if (authError) return authError;
 
@@ -87,9 +84,12 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
           );
         }
 
-        const body = (await request.json().catch(() => null)) as {
-          events?: WorkflowEventEnvelope[];
-        } | null;
+        const parsed = await readJsonRequest<{
+          events?: unknown[];
+        }>(request, config.maxRequestBytes);
+        if ("error" in parsed) return parsed.error;
+
+        const body = parsed.body;
 
         if (!body?.events || !Array.isArray(body.events)) {
           return Response.json({ error: "Missing events array" }, { status: 400 });
@@ -101,21 +101,29 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
           binding: CloudflareWorkflowBinding;
         }> = [];
 
-        for (const envelope of body.events) {
+        for (const [index, candidate] of body.events.entries()) {
           try {
+            if (!isWorkflowEventEnvelope(candidate)) {
+              throw new Error(`Invalid event structure at index ${index}`);
+            }
+
+            const envelope = candidate;
             if (!config.registry.has(envelope.name)) {
               throw new Error(`Unknown workflow: ${envelope.name}`);
             }
+
+            const workflow = config.registry.get(envelope.name);
+            const payload = config.registry.parsePayload(workflow, envelope.payload);
 
             const binding = config.resolveWorkflow(envelope.name, env);
             if (!binding) {
               throw new Error(`No Cloudflare Workflow binding for ${envelope.name}`);
             }
 
-            prepared.push({ envelope, binding });
+            prepared.push({ envelope: { ...envelope, payload }, binding });
           } catch (error) {
             errors.push({
-              id: envelope.id ?? "unknown",
+              id: getCandidateEventId(candidate),
               error: error instanceof Error ? error.message : String(error),
             });
           }
@@ -157,11 +165,12 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
         for (const run of collectDueCronRuns(workflow, current)) {
           const binding = config.resolveWorkflow(run.workflowName, env);
           if (!binding) continue;
+          const payload = config.registry.parsePayload(workflow, run.payload);
 
           const envelope: WorkflowEventEnvelope<string, WorkflowPayload> = {
             id: createCloudflareInstanceId(run.runKey),
             name: run.workflowName,
-            payload: run.payload,
+            payload,
             traceId: createWorkflowId("trace"),
             idempotencyKey: run.runKey,
             scheduledAt: run.scheduledAt.toISOString(),
@@ -221,13 +230,26 @@ async function createCloudflareWorkflowChunk(
 
   if (binding.createBatch) {
     try {
-      await binding.createBatch(
+      const created = await binding.createBatch(
         envelopes.map((envelope) => ({
           id: envelope.id,
           params: envelope,
         })),
       );
-      return envelopes;
+      const createdIds = getCreatedBatchIds(created);
+      if (createdIds) {
+        const accepted = envelopes.filter((envelope) => createdIds.has(envelope.id));
+        for (const envelope of envelopes) {
+          if (!createdIds.has(envelope.id)) {
+            errors.push({
+              id: envelope.id,
+              error: "Cloudflare Workflow instance was not created by createBatch",
+            });
+          }
+        }
+        return accepted;
+      }
+      if (created.length === envelopes.length) return envelopes;
     } catch {
       // Fall back to individual creates so one bad instance does not reject the
       // whole batch response when the platform provides per-instance errors.
@@ -271,6 +293,81 @@ function verifyRequestSize(
   }
 
   return null;
+}
+
+async function readJsonRequest<T>(
+  request: Request,
+  maxRequestBytes: number | false | undefined,
+): Promise<{ body: T | null } | { error: Response }> {
+  if (maxRequestBytes === false) {
+    return { body: (await request.json().catch(() => null)) as T | null };
+  }
+
+  const sizeError = verifyRequestSize(request, maxRequestBytes);
+  if (sizeError) return { error: sizeError };
+
+  const maxBytes = maxRequestBytes ?? 1_048_576;
+  if (!request.body) return { body: null };
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return { error: Response.json({ error: "Payload too large" }, { status: 413 }) };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch {
+    return { body: null };
+  }
+
+  if (!text) return { body: null };
+
+  try {
+    return { body: JSON.parse(text) as T };
+  } catch {
+    return { body: null };
+  }
+}
+
+function isWorkflowEventEnvelope(value: unknown): value is WorkflowEventEnvelope {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const envelope = value as Partial<WorkflowEventEnvelope>;
+  return (
+    typeof envelope.id === "string" &&
+    envelope.id.length > 0 &&
+    typeof envelope.name === "string" &&
+    envelope.name.length > 0 &&
+    typeof envelope.traceId === "string" &&
+    envelope.traceId.length > 0 &&
+    typeof envelope.idempotencyKey === "string" &&
+    envelope.idempotencyKey.length > 0 &&
+    typeof envelope.createdAt === "string" &&
+    typeof envelope.payload === "object" &&
+    envelope.payload !== null &&
+    !Array.isArray(envelope.payload)
+  );
+}
+
+function getCandidateEventId(value: unknown): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return "unknown";
+  }
+
+  const id = (value as { id?: unknown }).id;
+  return typeof id === "string" && id.length > 0 ? id : "unknown";
 }
 
 function createRateLimiter(
@@ -437,6 +534,20 @@ async function createCloudflareWorkflowInstance(
   }
 }
 
+function getCreatedBatchIds(created: unknown[]): Set<string> | null {
+  const ids = new Set<string>();
+
+  for (const item of created) {
+    if (typeof item !== "object" || item === null) return null;
+
+    const id = (item as { id?: unknown }).id;
+    if (typeof id !== "string" || id.length === 0) return null;
+    ids.add(id);
+  }
+
+  return ids;
+}
+
 function isMissingCloudflareInstanceError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /not\s*found|does\s*not\s*exist|no\s*such\s*instance|unknown\s*instance/i.test(message);
@@ -460,12 +571,17 @@ function verifyRequestAuth<TEnv>(
   env: TEnv,
   config: CloudflareDispatchHandlerConfig<TEnv>,
 ): Response | null {
-  const expected =
-    typeof config.auth?.bearerToken === "function"
-      ? config.auth.bearerToken(env)
-      : config.auth?.bearerToken;
+  const bearerToken = config.auth?.bearerToken;
+  if (bearerToken === undefined) return null;
 
-  if (!expected) return null;
+  const expected =
+    typeof bearerToken === "function" ? bearerToken(env) : bearerToken;
+
+  if (!expected) {
+    return new Response("Workflow dispatcher auth is not configured", {
+      status: 500,
+    });
+  }
 
   const header = request.headers.get("Authorization");
   if (!header?.startsWith("Bearer ")) {

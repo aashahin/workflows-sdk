@@ -54,6 +54,39 @@ describe("SignedHttpAdapter", () => {
     }
   });
 
+  test("keeps auth and config HTTP failures retryable", async () => {
+    const adapter = new SignedHttpAdapter({
+      baseUrl: "https://workflows.example.test",
+      authToken: "token",
+      fetch: (async () => new Response("Unauthorized", { status: 401 })) as unknown as typeof fetch,
+    });
+
+    try {
+      await adapter.dispatch(envelope());
+      throw new Error("dispatch should have failed");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as { nonRetryable?: boolean }).nonRetryable).toBeUndefined();
+    }
+  });
+
+  test("marks permanent request-shape HTTP failures as non-retryable", async () => {
+    const adapter = new SignedHttpAdapter({
+      baseUrl: "https://workflows.example.test",
+      authToken: "token",
+      fetch: (async () =>
+        Response.json({ error: "Missing events array" }, { status: 400 })) as unknown as typeof fetch,
+    });
+
+    try {
+      await adapter.dispatch(envelope());
+      throw new Error("dispatch should have failed");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as { nonRetryable?: boolean }).nonRetryable).toBe(true);
+    }
+  });
+
   test("exposes successful and failed ids for partial batch failures", async () => {
     const adapter = new SignedHttpAdapter({
       baseUrl: "https://workflows.example.test",

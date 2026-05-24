@@ -54,7 +54,7 @@ export class SignedHttpAdapter implements WorkflowAdapter {
         const error = new WorkflowSendError(
           `Workflow dispatcher responded with ${response.status}: ${body}`,
         );
-        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+        if (isPermanentDispatcherStatus(response.status)) {
           (error as { nonRetryable?: boolean }).nonRetryable = true;
         }
         throw error;
@@ -146,7 +146,11 @@ export class SignedHttpAdapter implements WorkflowAdapter {
 }
 
 function isNonRetryableDispatchError(message: string): boolean {
-  return /invalid event structure|missing events array|unknown (event|workflow)|no cloudflare workflow binding/i.test(
+  return /invalid event structure|missing events array|workflow payload validation failed|unknown (event|workflow)|no cloudflare workflow binding/i.test(
     message,
   );
+}
+
+function isPermanentDispatcherStatus(status: number): boolean {
+  return status === 400 || status === 404 || status === 409 || status === 422;
 }
