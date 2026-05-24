@@ -11,13 +11,13 @@ The SDK gives you one typed workflow contract:
 
 ## Installation
 
-Inside this monorepo the package is consumed as a workspace package:
+Install the package with your preferred JavaScript package manager:
 
 ```json
-"@abshahin/workflows-sdk": "workspace:*"
+"@abshahin/workflows-sdk": "^0.1.0"
 ```
 
-The package currently exports TypeScript source files directly and is intended for Bun/workspace usage. If it is published outside this monorepo, add a build step first or make sure the consuming runtime can load TypeScript subpath exports.
+The package exports TypeScript source files directly. Use it from runtimes and bundlers that can load TypeScript subpath exports, or compile it as part of your application build.
 
 ## Exports
 
@@ -260,7 +260,7 @@ There are two Cloudflare integration paths.
 
 ### Custom Worker Endpoint
 
-Use `SignedHttpAdapter` from an app/backend that dispatches to your own Worker endpoint:
+Use `SignedHttpAdapter` from any producer service that dispatches to your own Worker endpoint:
 
 ```ts
 import { createWorkflowClient } from "@abshahin/workflows-sdk";
@@ -346,7 +346,7 @@ const client = createWorkflowClient({
     accountId: Bun.env.CLOUDFLARE_ACCOUNT_ID!,
     apiToken: Bun.env.CLOUDFLARE_API_TOKEN!,
     workflowName(eventName) {
-      if (eventName.startsWith("email/")) return "manhali-email-workflow";
+      if (eventName.startsWith("email/")) return "email-workflow";
       throw new Error(`No Cloudflare Workflow for ${eventName}`);
     },
   }),
