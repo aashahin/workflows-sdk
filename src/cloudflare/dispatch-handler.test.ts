@@ -1,6 +1,103 @@
 import { describe, expect, test } from "bun:test";
 import { defineWorkflow, defineWorkflowRegistry } from "../index";
-import { createCloudflareDispatchHandler } from "./dispatch-handler";
+import {
+  createCloudflareDispatchHandler,
+  createCloudflareWorkflowDispatch,
+} from "./dispatch-handler";
+
+describe("createCloudflareWorkflowDispatch", () => {
+  test("creates idempotent Cloudflare instances for ctx.dispatch", async () => {
+    const workflow = defineWorkflow("email/send", {
+      schema: {
+        parse(value) {
+          if (
+            typeof value !== "object" ||
+            value === null ||
+            typeof (value as { email?: unknown }).email !== "string"
+          ) {
+            throw new Error("Workflow payload validation failed: email is required");
+          }
+          return value as Record<string, unknown>;
+        },
+      },
+      run: () => undefined,
+    });
+    const created: Array<{ id: string; params?: unknown }> = [];
+    const dispatch = createCloudflareWorkflowDispatch({
+      registry: defineWorkflowRegistry([workflow]),
+      now: () => new Date("2026-05-24T09:00:00.000Z"),
+      idGenerator: () => "wf_nested",
+      traceIdGenerator: () => "trace_nested",
+      resolveWorkflow() {
+        return {
+          create: async () => {
+            throw new Error("create should not be called");
+          },
+          createBatch: async (batch) => {
+            created.push(...batch);
+            return batch;
+          },
+        };
+      },
+    });
+
+    const result = await dispatch(
+      "email/send",
+      { email: "student@example.com" },
+      {
+        delayMs: 60_000,
+        idempotencyKey: "idem_nested",
+        metadata: { source: "parent" },
+      },
+      {},
+    );
+
+    expect(result.ids).toEqual(["wf_nested"]);
+    expect(result.instances?.[0]).toMatchObject({
+      id: "wf_nested",
+      name: "email/send",
+      status: "scheduled",
+      traceId: "trace_nested",
+      idempotencyKey: "idem_nested",
+      scheduledAt: "2026-05-24T09:01:00.000Z",
+    });
+    expect(created).toHaveLength(1);
+    expect(created[0]?.params).toMatchObject({
+      id: "wf_nested",
+      name: "email/send",
+      payload: { email: "student@example.com" },
+      metadata: { source: "parent" },
+    });
+  });
+
+  test("validates nested dispatch payloads before creating instances", async () => {
+    const workflow = defineWorkflow("email/send", {
+      schema: {
+        parse() {
+          throw new Error("Workflow payload validation failed: email is required");
+        },
+      },
+      run: () => undefined,
+    });
+    let created = 0;
+    const dispatch = createCloudflareWorkflowDispatch({
+      registry: defineWorkflowRegistry([workflow]),
+      resolveWorkflow() {
+        return {
+          create: async () => {
+            created++;
+            return {};
+          },
+        };
+      },
+    });
+
+    await expect(dispatch("email/send", {}, undefined, {})).rejects.toThrow(
+      "Workflow payload validation failed: email is required",
+    );
+    expect(created).toBe(0);
+  });
+});
 
 describe("createCloudflareDispatchHandler", () => {
   test("fails closed when configured bearer auth resolves empty", async () => {

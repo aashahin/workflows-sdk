@@ -1,7 +1,9 @@
 import { collectDueCronRuns } from "../scheduler/cron";
-import { createWorkflowId } from "../core/id";
+import { createTraceId, createWorkflowId } from "../core/id";
 import type { WorkflowRegistry } from "../core/registry";
 import type {
+  DispatchOptions,
+  DispatchResult,
   WorkflowEventEnvelope,
   WorkflowInstance,
   WorkflowPayload,
@@ -36,6 +38,74 @@ export interface CloudflareDispatchHandlerConfig<TEnv = unknown> {
     env: TEnv,
   ): CloudflareWorkflowBinding | null | undefined;
   now?: () => Date;
+}
+
+export interface CloudflareWorkflowDispatchConfig<TEnv = unknown> {
+  registry: WorkflowRegistry;
+  resolveWorkflow(
+    eventName: string,
+    env: TEnv,
+  ): CloudflareWorkflowBinding | null | undefined;
+  now?: () => Date;
+  idGenerator?: () => string;
+  traceIdGenerator?: () => string;
+}
+
+export function createCloudflareWorkflowDispatch<TEnv = unknown>(
+  config: CloudflareWorkflowDispatchConfig<TEnv>,
+) {
+  const now = config.now ?? (() => new Date());
+  const idGenerator = config.idGenerator ?? (() => createWorkflowId());
+  const traceIdGenerator = config.traceIdGenerator ?? (() => createTraceId());
+
+  return async function dispatchCloudflareWorkflow<
+    TPayload extends WorkflowPayload = WorkflowPayload,
+  >(
+    name: string,
+    payload: TPayload,
+    options: DispatchOptions | undefined,
+    env: TEnv,
+  ): Promise<DispatchResult> {
+    const workflow = config.registry.get(name);
+    const parsedPayload = config.registry.parsePayload(workflow, payload);
+    const binding = config.resolveWorkflow(name, env);
+    if (!binding) {
+      throw new Error(`No Cloudflare Workflow binding for ${name}`);
+    }
+
+    const createdAt = now();
+    const envelope: WorkflowEventEnvelope<string, WorkflowPayload> = {
+      id: options?.id ?? idGenerator(),
+      name,
+      payload: parsedPayload,
+      traceId: options?.traceId ?? traceIdGenerator(),
+      idempotencyKey: options?.idempotencyKey ?? createWorkflowId("idem"),
+      scheduledAt: resolveScheduledAt(createdAt, options),
+      createdAt: createdAt.toISOString(),
+      metadata: options?.metadata,
+    };
+
+    await createCloudflareWorkflowInstance(binding, envelope, {
+      allowExisting: true,
+    });
+
+    const instance: WorkflowInstance = {
+      id: envelope.id,
+      name: envelope.name,
+      status: envelope.scheduledAt ? "scheduled" : "queued",
+      traceId: envelope.traceId,
+      idempotencyKey: envelope.idempotencyKey,
+      scheduledAt: envelope.scheduledAt,
+      createdAt: envelope.createdAt,
+      updatedAt: now().toISOString(),
+    };
+
+    return {
+      ids: [envelope.id],
+      envelopes: [envelope],
+      instances: [instance],
+    };
+  };
 }
 
 export function createCloudflareDispatchHandler<TEnv = unknown>(
@@ -400,6 +470,25 @@ function createCloudflareInstanceId(runKey: string): string {
   const sanitized = runKey.replace(/[^a-zA-Z0-9_-]/g, "_");
   const hash = hashString(runKey);
   return `cron_${sanitized.slice(0, 86)}_${hash}`.slice(0, 100);
+}
+
+function resolveScheduledAt(
+  now: Date,
+  options: DispatchOptions | undefined,
+): string | undefined {
+  if (options?.scheduledAt instanceof Date) {
+    return options.scheduledAt.toISOString();
+  }
+
+  if (typeof options?.scheduledAt === "string") {
+    return new Date(options.scheduledAt).toISOString();
+  }
+
+  if (typeof options?.delayMs === "number" && options.delayMs > 0) {
+    return new Date(now.getTime() + options.delayMs).toISOString();
+  }
+
+  return undefined;
 }
 
 async function getStatusByName<TEnv>(

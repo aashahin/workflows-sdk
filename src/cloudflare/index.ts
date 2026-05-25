@@ -1,7 +1,9 @@
 export {
   createCloudflareDispatchHandler,
+  createCloudflareWorkflowDispatch,
   type CloudflareDispatchHandlerConfig,
   type CloudflareWorkflowBinding,
+  type CloudflareWorkflowDispatchConfig,
 } from "./dispatch-handler";
 export {
   createCloudflareWorkflowEntrypoint,
