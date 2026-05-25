@@ -50,6 +50,45 @@ describe("BunWorkflowRuntime", () => {
     expect(second.ids).toEqual(first.ids);
   });
 
+  test("injects services into workflow execution", async () => {
+    interface Services {
+      backend: {
+        execute(path: string): Promise<string>;
+      };
+    }
+
+    const adapter = new BunSqliteWorkflowAdapter({ path: ":memory:" });
+    const workflow = defineWorkflow<
+      "backend/call",
+      Record<string, unknown>,
+      string,
+      Services
+    >("backend/call", {
+      run(ctx) {
+        return ctx.services.backend.execute("backend/call");
+      },
+    });
+    const runtime = createBunWorkflowRuntime({
+      adapter,
+      registry: defineWorkflowRegistry([workflow]),
+      services: {
+        backend: {
+          async execute(path: string) {
+            return `called:${path}`;
+          },
+        },
+      },
+    });
+
+    const result = await runtime.client.dispatch("backend/call", {});
+    await runtime.processReady();
+
+    await expect(adapter.getInstance(result.ids[0]!)).resolves.toMatchObject({
+      status: "complete",
+      output: "called:backend/call",
+    });
+  });
+
   test("caches undefined step results", async () => {
     const adapter = new BunSqliteWorkflowAdapter({ path: ":memory:" });
     let calls = 0;

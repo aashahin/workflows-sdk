@@ -17,7 +17,7 @@ import type {
 
 export type BunSchedulerMode = "in-process" | "os" | "redis" | "external";
 
-export interface BunWorkflowRuntimeConfig {
+export interface BunWorkflowRuntimeConfig<TServices = unknown> {
   registry: WorkflowRegistry;
   adapter: WorkflowAdapter;
   scheduler?: {
@@ -27,12 +27,13 @@ export interface BunWorkflowRuntimeConfig {
     tickIntervalMs?: number;
   };
   logger?: WorkflowLogger;
+  services?: TServices;
   concurrency?: number;
   stalledTimeoutMs?: number;
   now?: () => Date;
 }
 
-export class BunWorkflowRuntime {
+export class BunWorkflowRuntime<TServices = unknown> {
   readonly client: WorkflowClient;
   private readonly logger: WorkflowLogger;
   private readonly now: () => Date;
@@ -41,7 +42,7 @@ export class BunWorkflowRuntime {
   private processing = false;
   private ticking = false;
 
-  constructor(private readonly config: BunWorkflowRuntimeConfig) {
+  constructor(private readonly config: BunWorkflowRuntimeConfig<TServices>) {
     this.client = new WorkflowClient({
       adapter: config.adapter,
       logger: config.logger,
@@ -153,6 +154,7 @@ export class BunWorkflowRuntime {
       registry: this.config.registry,
       client: this.client,
       logger: this.logger,
+      services: this.config.services,
       getStepResult: this.config.adapter.getStepResult?.bind(this.config.adapter),
       hasStepResult: this.config.adapter.hasStepResult?.bind(this.config.adapter),
       saveStepResult: this.config.adapter.saveStepResult?.bind(this.config.adapter),
@@ -364,14 +366,14 @@ function sanitizeCronTitle(title: string): string {
   return title.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120);
 }
 
-export function createBunWorkflowRuntime(
-  config: BunWorkflowRuntimeConfig,
-): BunWorkflowRuntime {
+export function createBunWorkflowRuntime<TServices = unknown>(
+  config: BunWorkflowRuntimeConfig<TServices>,
+): BunWorkflowRuntime<TServices> {
   return new BunWorkflowRuntime(config);
 }
 
-export function createBunWorkflowScheduledHandler(
-  config: BunWorkflowRuntimeConfig,
+export function createBunWorkflowScheduledHandler<TServices = unknown>(
+  config: BunWorkflowRuntimeConfig<TServices>,
 ): {
   scheduled(controller?: { cron?: string; scheduledTime?: number }): Promise<{
     claimed: number;
