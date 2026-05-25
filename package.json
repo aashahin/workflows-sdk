@@ -1,6 +1,6 @@
 {
   "name": "@abshahin/workflows-sdk",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Unified TypeScript SDK for typed workflows across Cloudflare Workflows and Bun runtimes.",
   "module": "./src/index.ts",
