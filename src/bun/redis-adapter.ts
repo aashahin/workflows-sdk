@@ -352,11 +352,6 @@ export class BunRedisWorkflowAdapter implements WorkflowAdapter {
     return this.key("step", instanceId, stepName);
   }
 
-  private async get(key: string): Promise<string | null> {
-    if (this.redis.get) return await this.redis.get(key);
-    return (await this.send("GET", [key])) as string | null;
-  }
-
   private async set(key: string, value: string, ...args: unknown[]): Promise<unknown> {
     return this.send("SET", [key, value, ...args]);
   }
