@@ -20,7 +20,20 @@ export {
   getNextCronDate,
   getNextCronDateInTimezone,
 } from "./scheduler/index";
+export {
+  createBackendCallbackWorkflowRegistry,
+  isNonRetryableCallbackWorkflowFailure,
+} from "./callback/backend-callback";
 export { createIdempotencyKey, createTraceId, createWorkflowId } from "./core/id";
+export type {
+  BackendCallbackExecuteContext,
+  BackendCallbackFailedEvent,
+  BackendCallbackFailedEventService,
+  BackendCallbackService,
+  BackendCallbackStep,
+  BackendCallbackWorkflowRegistryOptions,
+  BackendCallbackWorkflowServices,
+} from "./callback/backend-callback";
 export type {
   DispatchOptions,
   DispatchResult,
