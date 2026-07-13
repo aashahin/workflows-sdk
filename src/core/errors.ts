@@ -30,7 +30,15 @@ export class WorkflowValidationError extends WorkflowError {
   }
 }
 
-/** Max retries exhausted. */
+/**
+ * Max retries exhausted.
+ *
+ * Part of the SDK's public error taxonomy: runtime adapters that surface retry
+ * exhaustion explicitly may throw this, and consumers can match on it via
+ * `instanceof`. The built-in `withRetry` helper intentionally re-throws the
+ * underlying error unchanged (so `nonRetryable`/cause information is preserved),
+ * so the core runtime does not construct this itself.
+ */
 export class WorkflowRetryExhaustedError extends WorkflowError {
   public readonly attempts: number;
 
@@ -49,7 +57,13 @@ export class WorkflowNotFoundError extends WorkflowError {
   }
 }
 
-/** A workflow was claimed by another runtime instance. */
+/**
+ * A workflow was claimed by another runtime instance.
+ *
+ * Part of the SDK's public error taxonomy for adapters that use a claim/lease
+ * model (e.g. the Redis/SQLite Bun adapters); consumers can match on it via
+ * `instanceof` to detect claim races. Not thrown by the core runtime itself.
+ */
 export class WorkflowAlreadyClaimedError extends WorkflowError {
   constructor(message: string) {
     super(message, "WORKFLOW_ALREADY_CLAIMED");

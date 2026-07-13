@@ -219,4 +219,110 @@ describe("BunWorkflowRuntime", () => {
     expect(durationToMs("30 minutes")).toBe(1_800_000);
     expect(durationToMs("2 weeks")).toBe(14 * 86_400_000);
   });
+
+  test("dead-letters an unregistered workflow instead of throwing again", async () => {
+    const adapter = new BunSqliteWorkflowAdapter({ path: ":memory:" });
+    const runtime = createBunWorkflowRuntime({
+      adapter,
+      registry: defineWorkflowRegistry([]),
+    });
+
+    // An envelope whose workflow name is not (or no longer) registered.
+    await adapter.dispatch({
+      id: "ghost-1",
+      name: "ghost/workflow",
+      payload: {},
+      traceId: "trace",
+      idempotencyKey: "idem-ghost",
+      createdAt: new Date().toISOString(),
+    });
+
+    const processed = await runtime.processReady();
+    expect(processed).toBe(1);
+
+    const instance = await adapter.getInstance("ghost-1");
+    expect(instance?.status).toBe("dead");
+
+    const dead = adapter.db
+      .query(`select id from workflow_dead_letters where instance_id = ?`)
+      .get("ghost-1");
+    expect(dead).not.toBeNull();
+  });
+
+  test("does not requeue a succeeded workflow when persisting completion fails", async () => {
+    class FailingCompleteAdapter extends BunSqliteWorkflowAdapter {
+      completeCalls = 0;
+      override async updateInstance(
+        id: string,
+        status: Parameters<BunSqliteWorkflowAdapter["updateInstance"]>[1],
+        patch?: Parameters<BunSqliteWorkflowAdapter["updateInstance"]>[2],
+      ): Promise<void> {
+        if (status === "complete") {
+          this.completeCalls++;
+          throw new Error("db write failed");
+        }
+        return super.updateInstance(id, status, patch);
+      }
+    }
+
+    const adapter = new FailingCompleteAdapter({ path: ":memory:" });
+    let runs = 0;
+    const workflow = defineWorkflow("persist-fail", {
+      run: () => {
+        runs++;
+        return "ok";
+      },
+    });
+    const runtime = createBunWorkflowRuntime({
+      adapter,
+      registry: defineWorkflowRegistry([workflow]),
+    });
+
+    const result = await runtime.client.dispatch("persist-fail", {});
+    await runtime.processReady();
+
+    // Ran once, tried to persist completion twice (initial + one retry).
+    expect(runs).toBe(1);
+    expect(adapter.completeCalls).toBe(2);
+
+    // The succeeded run is NOT requeued or dead-lettered — it stays "running"
+    // and stalled recovery is the fallback, so a fresh drain re-runs nothing.
+    expect((await adapter.getInstance(result.ids[0]!))?.status).toBe("running");
+    await runtime.processReady();
+    expect(runs).toBe(1);
+  });
+
+  test("stop() waits for the in-flight drain to finish", async () => {
+    const adapter = new BunSqliteWorkflowAdapter({ path: ":memory:" });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let completed = false;
+    const workflow = defineWorkflow("slow", {
+      async run() {
+        await gate;
+        completed = true;
+        return "done";
+      },
+    });
+    const runtime = createBunWorkflowRuntime({
+      adapter,
+      registry: defineWorkflowRegistry([workflow]),
+    });
+
+    const result = await runtime.client.dispatch("slow", {});
+    const draining = runtime.processReady();
+    // Let the drain claim the job and enter the (blocked) run().
+    await Promise.resolve();
+
+    const stopPromise = runtime.stop();
+    release();
+    await stopPromise;
+
+    // stop() must not resolve until the running job has finished.
+    expect(completed).toBe(true);
+    expect((await adapter.getInstance(result.ids[0]!))?.status).toBe("complete");
+    await draining;
+  });
 });

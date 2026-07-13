@@ -6,6 +6,8 @@ import type {
   WorkflowStatus,
 } from "../core/types";
 
+const MAX_CACHED_INSTANCE_NAMES = 10_000;
+
 export interface CloudflareRestWorkflowAdapterConfig {
   accountId: string;
   apiToken: string;
@@ -44,7 +46,7 @@ export class CloudflareRestWorkflowAdapter implements WorkflowAdapter {
     );
 
     const result = parseCloudflareResult(response);
-    this.instanceNames.set(envelope.id, workflowName);
+    this.rememberInstanceName(envelope.id, workflowName);
     return {
       id: String(result.id ?? envelope.id),
       name: envelope.name,
@@ -62,7 +64,27 @@ export class CloudflareRestWorkflowAdapter implements WorkflowAdapter {
   ): Promise<WorkflowInstance[]> {
     const instances: WorkflowInstance[] = [];
     for (const envelope of envelopes) {
-      instances.push(await this.dispatch(envelope));
+      try {
+        instances.push(await this.dispatch(envelope));
+      } catch (error) {
+        // A mid-batch failure would otherwise discard the instances already
+        // created, and WorkflowClient.dispatchBatch treats any throw as a total
+        // batch failure — re-dispatching succeeded envelopes with fresh ids and
+        // creating duplicates. Attach the already-dispatched ids (mirroring
+        // SignedHttpAdapter) so callers can skip them on retry.
+        const sendError =
+          error instanceof WorkflowSendError
+            ? error
+            : new WorkflowSendError(
+                `Failed to dispatch workflow batch: ${error instanceof Error ? error.message : String(error)}`,
+                error,
+              );
+        (sendError as { dispatchedIds?: string[]; failedIds?: string[] }).dispatchedIds =
+          instances.map((instance) => instance.id);
+        (sendError as { dispatchedIds?: string[]; failedIds?: string[] }).failedIds =
+          envelopes.slice(instances.length).map((pending) => pending.id);
+        throw sendError;
+      }
     }
     return instances;
   }
@@ -100,6 +122,19 @@ export class CloudflareRestWorkflowAdapter implements WorkflowAdapter {
     return typeof this.config.workflowName === "function"
       ? this.config.workflowName(eventName)
       : this.config.workflowName;
+  }
+
+  // instanceNames caches the workflow name for a dispatched id so a later
+  // getInstance(id) without an explicit name can resolve it. In a long-lived
+  // process the map would otherwise grow one entry per dispatch forever, so it
+  // is bounded with simple FIFO eviction (Map preserves insertion order).
+  private rememberInstanceName(id: string, workflowName: string): void {
+    this.instanceNames.set(id, workflowName);
+    while (this.instanceNames.size > MAX_CACHED_INSTANCE_NAMES) {
+      const oldest = this.instanceNames.keys().next().value;
+      if (oldest === undefined) break;
+      this.instanceNames.delete(oldest);
+    }
   }
 
   private async request(

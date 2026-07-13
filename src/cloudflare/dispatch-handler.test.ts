@@ -209,6 +209,31 @@ describe("createCloudflareDispatchHandler", () => {
     });
   });
 
+  test("returns a controlled 502 when a status binding fails unexpectedly", async () => {
+    const workflow = defineWorkflow("email/send", { run: () => undefined });
+    const handler = createCloudflareDispatchHandler({
+      registry: defineWorkflowRegistry([workflow]),
+      resolveWorkflow() {
+        return {
+          create: async () => ({}),
+          get: async () => {
+            throw new Error("Cloudflare API unavailable");
+          },
+        };
+      },
+    });
+
+    const response = await handler.fetch(
+      new Request("https://example.com/status/wf_1?name=email/send"),
+      {},
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "Cloudflare API unavailable",
+    });
+  });
+
   test("scheduled cron uses idempotent createBatch when available", async () => {
     const workflow = defineWorkflow("daily", {
       cron: [{ name: "nine", schedule: "0 9 * * *" }],
@@ -231,7 +256,10 @@ describe("createCloudflareDispatchHandler", () => {
       },
     });
 
-    await expect(handler.scheduled({}, {})).resolves.toEqual({ dispatched: 1 });
+    await expect(handler.scheduled({}, {})).resolves.toEqual({
+      dispatched: 1,
+      errors: 0,
+    });
     expect(created).toHaveLength(1);
   });
 
@@ -259,13 +287,13 @@ describe("createCloudflareDispatchHandler", () => {
 
     await expect(
       handler.scheduled({ scheduledTime: Date.parse("2026-05-24T09:05:00.000Z") }, {}),
-    ).resolves.toEqual({ dispatched: 1 });
+    ).resolves.toEqual({ dispatched: 1, errors: 0 });
     expect((created[0]?.params as { scheduledAt?: string }).scheduledAt).toBe(
       "2026-05-24T09:00:00.000Z",
     );
   });
 
-  test("scheduled cron validates payloads before creating instances", async () => {
+  test("scheduled cron isolates a failing run and reports it via errors count", async () => {
     const workflow = defineWorkflow("daily", {
       cron: [{ name: "nine", schedule: "0 9 * * *" }],
       schema: {
@@ -289,10 +317,51 @@ describe("createCloudflareDispatchHandler", () => {
       },
     });
 
-    await expect(handler.scheduled({}, {})).rejects.toThrow(
-      "Workflow payload validation failed: tenantId is required",
-    );
+    // A payload validation failure no longer aborts the whole sweep; it is
+    // isolated per-run, counted, and the handler resolves.
+    await expect(handler.scheduled({}, {})).resolves.toEqual({
+      dispatched: 0,
+      errors: 1,
+    });
     expect(created).toBe(0);
+  });
+
+  test("scheduled cron continues to remaining workflows after one throws", async () => {
+    const failing = defineWorkflow("failing", {
+      cron: [{ name: "nine", schedule: "0 9 * * *" }],
+      schema: {
+        parse() {
+          throw new Error("Workflow payload validation failed");
+        },
+      },
+      run: () => undefined,
+    });
+    const healthy = defineWorkflow("healthy", {
+      cron: [{ name: "nine", schedule: "0 9 * * *" }],
+      run: () => undefined,
+    });
+    const created: unknown[] = [];
+    const handler = createCloudflareDispatchHandler({
+      registry: defineWorkflowRegistry([failing, healthy]),
+      now: () => new Date("2026-05-24T09:05:00.000Z"),
+      resolveWorkflow() {
+        return {
+          create: async () => {
+            throw new Error("create should not be called");
+          },
+          createBatch: async (batch: unknown[]) => {
+            created.push(...batch);
+            return batch;
+          },
+        };
+      },
+    });
+
+    await expect(handler.scheduled({}, {})).resolves.toEqual({
+      dispatched: 1,
+      errors: 1,
+    });
+    expect(created).toHaveLength(1);
   });
 
   test("rejects oversized dispatch requests before parsing JSON", async () => {

@@ -1,21 +1,26 @@
 {
-  "extends": "../../tsconfig.json",
   "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "verbatimModuleSyntax": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
     "rootDir": "./src",
     "outDir": "./dist",
     "declaration": true,
     "declarationMap": true,
-    "composite": true,
-    "noUncheckedIndexedAccess": true,
     "noEmit": true,
+    "types": ["bun-types"],
     "paths": {
       "@/*": ["./src/*"]
     },
     // include DOM types so globals like `fetch`/`AbortController`/`setTimeout` are available
     "lib": ["ESNext", "DOM"]
-    // "noUnusedLocals": true,
-    // "noUnusedParameters": true,
-    // "noPropertyAccessFromIndexSignature": true
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]

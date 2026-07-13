@@ -7,6 +7,7 @@ export {
   durationToMs,
   runWorkflowEnvelope,
 } from "./core/runtime";
+export type { WorkflowRuntimeOptions } from "./core/runtime";
 export {
   WorkflowAlreadyClaimedError,
   WorkflowError,

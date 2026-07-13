@@ -6,6 +6,7 @@ class FakeRedis {
   readonly strings = new Map<string, string>();
   readonly hashes = new Map<string, Record<string, string>>();
   readonly sortedSets = new Map<string, Map<string, number>>();
+  readonly expirations = new Map<string, number>();
 
   async send(command: string, args: unknown[]): Promise<unknown> {
     switch (command.toUpperCase()) {
@@ -19,8 +20,19 @@ class FakeRedis {
       }
       case "GET":
         return this.strings.get(String(args[0])) ?? null;
-      case "DEL":
-        return this.strings.delete(String(args[0])) ? 1 : 0;
+      case "DEL": {
+        const key = String(args[0]);
+        const removed = this.strings.delete(key);
+        this.hashes.delete(key);
+        return removed ? 1 : 0;
+      }
+      case "EXPIRE": {
+        const key = String(args[0]);
+        this.expirations.set(key, Number(args[1]));
+        return this.strings.has(key) || this.hashes.has(key) || this.sortedSets.has(key)
+          ? 1
+          : 0;
+      }
       case "HSET": {
         const key = String(args[0]);
         const fields = args.slice(1).map(String);
@@ -62,8 +74,31 @@ class FakeRedis {
       case "EVAL": {
         const script = String(args[0]);
         if (script.includes("ZRANGEBYSCORE")) {
-          const [, , queueKey, leasePrefix, processingKey, maxScore, ttlMs, now, token] =
-            args as [string, number, string, string, string, string | number, number, number, string];
+          const [
+            ,
+            ,
+            queueKey,
+            leasePrefix,
+            processingKey,
+            instancePrefix,
+            maxScore,
+            ,
+            now,
+            token,
+            updatedAt,
+          ] = args as [
+            string,
+            number,
+            string,
+            string,
+            string,
+            string,
+            string | number,
+            number,
+            number,
+            string,
+            string,
+          ];
           const max = maxScore === "+inf" ? Infinity : Number(maxScore);
           const due = [...(this.sortedSets.get(queueKey)?.entries() ?? [])]
             .filter(([, score]) => score <= max)
@@ -76,8 +111,14 @@ class FakeRedis {
           this.strings.set(leaseKey, String(token));
           this.sortedSets.get(queueKey)?.delete(due);
           const processing = this.sortedSets.get(processingKey) ?? new Map<string, number>();
-          processing.set(due, Number(now) + Number(ttlMs));
+          // Score is the claim time (mirrors the real Lua script).
+          processing.set(due, Number(now));
           this.sortedSets.set(processingKey, processing);
+          const instanceHash = this.hashes.get(`${instancePrefix}:${due}`);
+          if (instanceHash) {
+            instanceHash.status = "running";
+            instanceHash.updatedAt = String(updatedAt);
+          }
           return due;
         }
 
@@ -241,5 +282,70 @@ describe("BunRedisWorkflowAdapter", () => {
 
     await expect(adapter.hasStepResult("job-1", "side-effect")).resolves.toBe(true);
     await expect(adapter.getStepResult("job-1", "side-effect")).resolves.toBeUndefined();
+  });
+
+  test("recovers a stalled job whose status never advanced to running", async () => {
+    const redis = new FakeRedis();
+    const adapter = new BunRedisWorkflowAdapter({ client: redis });
+
+    await adapter.dispatch(envelope("job-x"));
+
+    // Simulate a crash after the atomic claim moved the id into processing but
+    // before the running-status write: the id sits in processing, the instance
+    // JSON still says "queued", and there is no dedicated status field.
+    redis.sortedSets.get("workflows:ready")?.delete("job-x");
+    const processing =
+      redis.sortedSets.get("workflows:processing") ?? new Map<string, number>();
+    processing.set("job-x", Date.now() - 10_000);
+    redis.sortedSets.set("workflows:processing", processing);
+    redis.strings.set("workflows:lease:job-x", "token");
+
+    const recovered = await adapter.recoverStalled(new Date(Date.now() - 5_000));
+    expect(recovered).toBe(1);
+    expect((await adapter.getInstance("job-x"))?.status).toBe("queued");
+    expect(
+      await adapter.claimNext(new Date("2026-05-24T09:00:00.000Z")),
+    ).toMatchObject({ id: "job-x" });
+  });
+
+  test("does not re-enqueue a terminal job found in processing", async () => {
+    const redis = new FakeRedis();
+    const adapter = new BunRedisWorkflowAdapter({ client: redis });
+
+    await adapter.dispatch(envelope("job-done"));
+    await adapter.updateInstance("job-done", "complete", { output: 1 });
+
+    const processing =
+      redis.sortedSets.get("workflows:processing") ?? new Map<string, number>();
+    processing.set("job-done", Date.now() - 10_000);
+    redis.sortedSets.set("workflows:processing", processing);
+
+    const recovered = await adapter.recoverStalled(new Date(Date.now() - 5_000));
+    expect(recovered).toBe(0);
+    expect((await adapter.getInstance("job-done"))?.status).toBe("complete");
+    expect(redis.sortedSets.get("workflows:processing")?.has("job-done")).toBe(false);
+  });
+
+  test("expires terminal instance, step, and dead-letter hashes", async () => {
+    const redis = new FakeRedis();
+    const adapter = new BunRedisWorkflowAdapter({
+      client: redis,
+      retention: { completedTtlSeconds: 100, deadLetterTtlSeconds: 200 },
+    });
+
+    await adapter.dispatch(envelope("job-r"));
+    await adapter.saveStepResult("job-r", "step", 1);
+    await adapter.updateInstance("job-r", "complete", { output: 1 });
+    await adapter.recordDeadLetter(envelope("job-d"), new Error("boom"));
+
+    expect(redis.expirations.get("workflows:instance:job-r")).toBe(100);
+    expect(redis.expirations.get("workflows:step:job-r:step")).toBe(200);
+    expect(redis.expirations.get("workflows:dead:job-d")).toBe(200);
+  });
+
+  test("throws at construction for an unusable Redis client", () => {
+    expect(() => new BunRedisWorkflowAdapter({ client: {} })).toThrow(
+      /Unusable Redis client/,
+    );
   });
 });

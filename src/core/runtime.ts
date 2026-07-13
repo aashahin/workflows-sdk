@@ -51,6 +51,12 @@ export function createRunContext<TServices = unknown>(
 ): WorkflowRunContext<TServices> {
   const logger = options.logger ?? consoleLogger;
   const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  // Derive the dispatch client the same way runWorkflowEnvelope does, so direct
+  // callers of createRunContext get a working ctx.dispatch() from clientConfig.
+  const resolvedClient =
+    client ??
+    options.client ??
+    (options.clientConfig ? new WorkflowClient(options.clientConfig) : undefined);
 
   return {
     event: envelope,
@@ -111,10 +117,10 @@ export function createRunContext<TServices = unknown>(
       payload: TPayload,
       dispatchOptions?: DispatchOptions,
     ): Promise<DispatchResult> {
-      if (!client) {
+      if (!resolvedClient) {
         throw new Error("ctx.dispatch requires a workflow client");
       }
-      return client.dispatch(name, payload, dispatchOptions);
+      return resolvedClient.dispatch(name, payload, dispatchOptions);
     },
   };
 }
@@ -126,21 +132,36 @@ export function durationToMs(durationOrDate: number | Date | string): number {
     return Math.max(0, durationOrDate.getTime() - Date.now());
   }
 
-  const date = Date.parse(durationOrDate);
-  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  const trimmed = durationOrDate.trim();
 
-  const match = durationOrDate
-    .trim()
-    .match(
-      /^(\d+(?:\.\d+)?)\s*(ms|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|yr|yrs|year|years)$/i,
-    );
-  if (!match) throw new Error(`Unsupported duration "${durationOrDate}"`);
+  // 1) Unit-suffixed duration string ("5s", "10 minutes").
+  const match = trimmed.match(
+    /^(\d+(?:\.\d+)?)\s*(ms|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|yr|yrs|year|years)$/i,
+  );
+  if (match) {
+    const value = Number(match[1]);
+    const unit = match[2]?.toLowerCase();
+    const multiplier = getDurationMultiplier(unit);
+    return Math.max(0, value * multiplier);
+  }
 
-  const value = Number(match[1]);
-  const unit = match[2]?.toLowerCase();
-  const multiplier = getDurationMultiplier(unit);
+  // 2) Bare numeric string ("500") is treated as milliseconds, matching the
+  // numeric overload — never routed to Date.parse (which would misread it as a
+  // calendar year and silently collapse the sleep to zero).
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    return Math.max(0, Number(trimmed));
+  }
 
-  return Math.max(0, value * multiplier);
+  // 3) Only clearly date-like strings (those carrying a date/time separator)
+  // fall through to Date.parse. Date.parse is permissive enough to coerce cron
+  // expressions and other free text into a (usually past) calendar date, so we
+  // gate it behind a separator check and otherwise reject the input outright.
+  if (/[-/:]/.test(trimmed)) {
+    const date = Date.parse(trimmed);
+    if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  }
+
+  throw new Error(`Unsupported duration "${durationOrDate}"`);
 }
 
 function getDurationMultiplier(unit: string | undefined): number {
@@ -190,20 +211,46 @@ function getDurationMultiplier(unit: string | undefined): number {
   }
 }
 
+/**
+ * Race an operation against a timeout. A JavaScript promise cannot be
+ * cancelled, so the underlying operation keeps running after a timeout fires.
+ * We track a single `settled` flag so that only the winning branch is ever
+ * observed: a timed-out attempt that completes (or rejects) late is swallowed
+ * and can neither surface as an unhandled rejection nor clobber the result of
+ * the retry that replaced it. (See WorkflowStepOptions.timeoutMs for the
+ * concurrent-execution hazard this does NOT solve.)
+ */
 function withTimeout<T>(
   operation: () => Promise<T>,
   timeoutMs: number,
 ): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
 
-  return Promise.race([
-    operation(),
-    new Promise<T>((_, reject) => {
-      timeout = setTimeout(() => {
-        reject(new Error(`Workflow step timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    }),
-  ]).finally(() => {
+  const attempt = Promise.resolve()
+    .then(operation)
+    .then(
+      (value) => {
+        if (settled) return undefined as never; // lost the race — drop the value
+        settled = true;
+        return value;
+      },
+      (error) => {
+        if (settled) return undefined as never; // lost the race — swallow late failure
+        settled = true;
+        throw error;
+      },
+    );
+
+  const timer = new Promise<T>((_, reject) => {
+    timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Workflow step timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([attempt, timer]).finally(() => {
     if (timeout) clearTimeout(timeout);
   });
 }

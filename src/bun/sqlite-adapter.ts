@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { WorkflowValidationError } from "../core/errors";
 import type {
   WorkflowAdapter,
   WorkflowEventEnvelope,
@@ -9,15 +10,45 @@ import type {
 export interface BunSqliteAdapterConfig {
   path: string;
   namespace?: string;
+  /**
+   * Retention window for terminal workflow rows. Without this, workflow
+   * instances, step results, cron runs and dead letters accumulate forever.
+   * Pruning runs opportunistically (batched deletes) inside recoverStalled.
+   */
+  retention?: {
+    /** Age (seconds) after which terminal instances + step results are pruned. Default 7 days. */
+    completedTtlSeconds?: number;
+    /** Age (seconds) after which dead-letter rows are pruned. Default 30 days. */
+    deadLetterTtlSeconds?: number;
+  };
+}
+
+const TERMINAL_STATUSES = [
+  "complete",
+  "failed",
+  "errored",
+  "dead",
+  "cancelled",
+  "terminated",
+] as const;
+
+interface ResolvedRetention {
+  completedTtlSeconds: number;
+  deadLetterTtlSeconds: number;
 }
 
 export class BunSqliteWorkflowAdapter implements WorkflowAdapter {
   readonly db: Database;
   private readonly namespace: string;
+  private readonly retention: ResolvedRetention;
 
   constructor(config: BunSqliteAdapterConfig) {
     this.db = new Database(config.path);
     this.namespace = config.namespace ?? "default";
+    this.retention = {
+      completedTtlSeconds: config.retention?.completedTtlSeconds ?? 7 * 86_400,
+      deadLetterTtlSeconds: config.retention?.deadLetterTtlSeconds ?? 30 * 86_400,
+    };
     this.migrate();
   }
 
@@ -265,7 +296,60 @@ export class BunSqliteWorkflowAdapter implements WorkflowAdapter {
         before.toISOString(),
       );
 
+    // Opportunistically prune terminal rows so the database does not grow
+    // without bound in long-running deployments.
+    this.pruneTerminalRows();
+
     return result.changes;
+  }
+
+  private pruneTerminalRows(now = new Date()): void {
+    const completedCutoff = new Date(
+      now.getTime() - this.retention.completedTtlSeconds * 1000,
+    ).toISOString();
+    const deadLetterCutoff = new Date(
+      now.getTime() - this.retention.deadLetterTtlSeconds * 1000,
+    ).toISOString();
+    const terminal = TERMINAL_STATUSES.map(() => "?").join(", ");
+
+    this.db.transaction(() => {
+      // Step results for pruned terminal instances (no FK cascade defined).
+      this.db
+        .query(
+          `delete from workflow_step_results
+           where namespace = ?
+             and instance_id in (
+               select id from workflow_instances
+               where namespace = ?
+                 and status in (${terminal})
+                 and updated_at < ?
+             )`,
+        )
+        .run(this.namespace, this.namespace, ...TERMINAL_STATUSES, completedCutoff);
+
+      this.db
+        .query(
+          `delete from workflow_instances
+           where namespace = ?
+             and status in (${terminal})
+             and updated_at < ?`,
+        )
+        .run(this.namespace, ...TERMINAL_STATUSES, completedCutoff);
+
+      this.db
+        .query(
+          `delete from workflow_cron_runs
+           where namespace = ? and created_at < ?`,
+        )
+        .run(this.namespace, completedCutoff);
+
+      this.db
+        .query(
+          `delete from workflow_dead_letters
+           where namespace = ? and created_at < ?`,
+        )
+        .run(this.namespace, deadLetterCutoff);
+    })();
   }
 
   async updateInstance(
@@ -485,7 +569,10 @@ export class BunSqliteWorkflowAdapter implements WorkflowAdapter {
 }
 
 function normalizeDateString(value: Date | string | undefined): string | undefined {
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value === "string") return new Date(value).toISOString();
-  return undefined;
+  if (value === undefined) return undefined;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new WorkflowValidationError(`Invalid scheduledAt: ${String(value)}`);
+  }
+  return date.toISOString();
 }

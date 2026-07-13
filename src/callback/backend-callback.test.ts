@@ -336,4 +336,31 @@ describe("createBackendCallbackWorkflowRegistry", () => {
       workflow.run(ctx, { tenantId: "tenant_1", transactionId: "tx_1" }),
     ).rejects.toThrow("requires stepName and backendPath");
   });
+
+  test("rejects duplicate stepName entries before any step executes", async () => {
+    const calls: string[] = [];
+    const workflowName = "payment/process-payout";
+    const workflow = registry.get(workflowName);
+    const ctx = createFastTestContext(
+      workflowName,
+      {
+        backend: {
+          async execute(path) {
+            calls.push(path);
+          },
+        },
+      },
+      {
+        callbackSteps: [
+          { stepName: "notify", backendPath: "payment/step-a" },
+          { stepName: "notify", backendPath: "payment/step-b" },
+        ],
+      },
+    );
+
+    await expect(
+      workflow.run(ctx, { tenantId: "tenant_1", transactionId: "tx_1" }),
+    ).rejects.toThrow('duplicate stepName "notify"');
+    expect(calls).toEqual([]);
+  });
 });

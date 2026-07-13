@@ -1,5 +1,6 @@
 import { collectDueCronRuns } from "../scheduler/cron";
 import { createTraceId, createWorkflowId } from "../core/id";
+import { WorkflowValidationError } from "../core/errors";
 import type { WorkflowRegistry } from "../core/registry";
 import type {
   DispatchOptions,
@@ -128,9 +129,21 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
 
         const id = url.pathname.slice("/status/".length);
         const name = url.searchParams.get("name");
-        const target = name
-          ? await getStatusByName(id, name, env, config)
-          : await findStatusById(id, env, config);
+        let target: { workflowName: string; status: unknown } | null;
+        try {
+          target = name
+            ? await getStatusByName(id, name, env, config)
+            : await findStatusById(id, env, config);
+        } catch (error) {
+          // Unexpected binding.get()/status() failures (transient Cloudflare API
+          // error, network failure, or an error whose message does not match the
+          // "not found" heuristic) are surfaced as a controlled JSON 502 rather
+          // than crashing fetch() with an unhandled rejection.
+          return Response.json(
+            { error: error instanceof Error ? error.message : String(error) },
+            { status: 502 },
+          );
+        }
         if (!target) {
           return Response.json(
             { error: `No status binding for ${name ?? id}` },
@@ -223,8 +236,9 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
     async scheduled(
       controller: { scheduledTime?: number } | unknown,
       env: TEnv,
-    ): Promise<{ dispatched: number }> {
+    ): Promise<{ dispatched: number; errors: number }> {
       let dispatched = 0;
+      let errors = 0;
       const scheduledTime =
         typeof (controller as { scheduledTime?: unknown } | null)?.scheduledTime === "number"
           ? new Date((controller as { scheduledTime: number }).scheduledTime)
@@ -232,30 +246,56 @@ export function createCloudflareDispatchHandler<TEnv = unknown>(
       const current = scheduledTime;
 
       for (const workflow of config.registry.workflows) {
-        for (const run of collectDueCronRuns(workflow, current)) {
-          const binding = config.resolveWorkflow(run.workflowName, env);
-          if (!binding) continue;
-          const payload = config.registry.parsePayload(workflow, run.payload);
-
-          const envelope: WorkflowEventEnvelope<string, WorkflowPayload> = {
-            id: createCloudflareInstanceId(run.runKey),
-            name: run.workflowName,
-            payload,
-            traceId: createWorkflowId("trace"),
-            idempotencyKey: run.runKey,
-            scheduledAt: run.scheduledAt.toISOString(),
-            createdAt: current.toISOString(),
-            metadata: run.metadata,
-          };
-
-          const created = await createCloudflareWorkflowInstance(binding, envelope, {
-            allowExisting: true,
+        // Per-workflow isolation: an unsupported cron string or a bug in
+        // collectDueCronRuns must not abort the whole sweep for other workflows.
+        let dueRuns;
+        try {
+          dueRuns = collectDueCronRuns(workflow, current);
+        } catch (error) {
+          errors++;
+          console.error("workflow.cron_collect_failed", {
+            workflow: workflow.name,
+            error: error instanceof Error ? error.message : String(error),
           });
-          if (created) dispatched++;
+          continue;
+        }
+
+        for (const run of dueRuns) {
+          // Per-run isolation mirrors the POST /dispatch handler: one bad run
+          // (payload parse failure, create failure) is logged and skipped so it
+          // cannot block the remaining due runs.
+          try {
+            const binding = config.resolveWorkflow(run.workflowName, env);
+            if (!binding) continue;
+            const payload = config.registry.parsePayload(workflow, run.payload);
+
+            const envelope: WorkflowEventEnvelope<string, WorkflowPayload> = {
+              id: createCloudflareInstanceId(run.runKey),
+              name: run.workflowName,
+              payload,
+              traceId: createWorkflowId("trace"),
+              idempotencyKey: run.runKey,
+              scheduledAt: run.scheduledAt.toISOString(),
+              createdAt: current.toISOString(),
+              metadata: run.metadata,
+            };
+
+            const created = await createCloudflareWorkflowInstance(binding, envelope, {
+              allowExisting: true,
+            });
+            if (created) dispatched++;
+          } catch (error) {
+            errors++;
+            console.error("workflow.cron_dispatch_failed", {
+              workflow: run.workflowName,
+              runKey: run.runKey,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
       }
 
-      return { dispatched };
+      return { dispatched, errors };
     },
   };
 }
@@ -446,6 +486,13 @@ function getCandidateEventId(value: unknown): string {
   return typeof id === "string" && id.length > 0 ? id : "unknown";
 }
 
+// NOTE: This fixed-window limiter keeps its counter in per-isolate closure
+// state. Cloudflare Workers run many isolates across PoPs, each with its own
+// window, so the effective accepted rate is `max * <isolate count>` and a
+// client spreading requests can bypass it; fixed windows also permit ~2x bursts
+// at window boundaries. Treat it as best-effort in-process throttling only —
+// for true global enforcement back it with a Cloudflare Rate Limiting binding or
+// a Durable Object counter.
 function createRateLimiter(
   rateLimit: CloudflareDispatchHandlerConfig["rateLimit"],
 ): () => boolean {
@@ -481,7 +528,13 @@ function resolveScheduledAt(
   }
 
   if (typeof options?.scheduledAt === "string") {
-    return new Date(options.scheduledAt).toISOString();
+    const date = new Date(options.scheduledAt);
+    if (Number.isNaN(date.getTime())) {
+      throw new WorkflowValidationError(
+        `Invalid scheduledAt: ${options.scheduledAt}`,
+      );
+    }
+    return date.toISOString();
   }
 
   if (typeof options?.delayMs === "number" && options.delayMs > 0) {

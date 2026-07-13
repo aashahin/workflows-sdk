@@ -12,6 +12,8 @@ export interface SignedHttpAdapterConfig {
   fetch?: typeof fetch;
 }
 
+const MAX_INSTANCE_NAMES = 10_000;
+
 export class SignedHttpAdapter implements WorkflowAdapter {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
@@ -22,6 +24,14 @@ export class SignedHttpAdapter implements WorkflowAdapter {
     this.baseUrl = config.baseUrl.replace(/\/+$/, "");
     this.timeoutMs = config.timeoutMs ?? 10_000;
     this.fetchImpl = config.fetch ?? fetch;
+  }
+
+  private rememberInstanceName(id: string, name: string): void {
+    this.instanceNames.set(id, name);
+    if (this.instanceNames.size > MAX_INSTANCE_NAMES) {
+      const oldest = this.instanceNames.keys().next().value;
+      if (oldest !== undefined) this.instanceNames.delete(oldest);
+    }
   }
 
   async dispatch(envelope: WorkflowEventEnvelope): Promise<WorkflowInstance> {
@@ -92,9 +102,15 @@ export class SignedHttpAdapter implements WorkflowAdapter {
           );
         }
         for (const instance of result.instances) {
-          this.instanceNames.set(instance.id, instance.name);
+          this.rememberInstanceName(instance.id, instance.name);
         }
         return result.instances;
+      }
+
+      if (result.ids && result.ids.length !== envelopes.length) {
+        throw new WorkflowSendError(
+          `Workflow dispatcher returned ${result.ids.length}/${envelopes.length} instances`,
+        );
       }
 
       const instances = (result.ids ?? []).map((id) => ({
@@ -103,7 +119,7 @@ export class SignedHttpAdapter implements WorkflowAdapter {
         status: "queued" as const,
       }));
       for (const instance of instances) {
-        this.instanceNames.set(instance.id, instance.name);
+        this.rememberInstanceName(instance.id, instance.name);
       }
       return instances;
     } catch (error) {
@@ -126,22 +142,37 @@ export class SignedHttpAdapter implements WorkflowAdapter {
     const url = new URL(`${this.baseUrl}/status/${id}`);
     if (name) url.searchParams.set("name", name);
 
-    const response = await this.fetchImpl(url, {
-      headers: {
-        Authorization: `Bearer ${this.config.authToken}`,
-      },
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
-    if (response.status === 404) return null;
-    if (!response.ok) {
+    try {
+      const response = await this.fetchImpl(url, {
+        headers: {
+          Authorization: `Bearer ${this.config.authToken}`,
+        },
+        signal: controller.signal,
+      });
+
+      if (response.status === 404) return null;
+      if (!response.ok) {
+        throw new WorkflowSendError(
+          `Workflow status responded with ${response.status}: ${await response
+            .text()
+            .catch(() => "")}`,
+        );
+      }
+
+      return (await response.json()) as WorkflowInstance;
+    } catch (error) {
+      if (error instanceof WorkflowSendError) throw error;
+
       throw new WorkflowSendError(
-        `Workflow status responded with ${response.status}: ${await response
-          .text()
-          .catch(() => "")}`,
+        `Failed to fetch workflow status: ${error instanceof Error ? error.message : String(error)}`,
+        error,
       );
+    } finally {
+      clearTimeout(timeout);
     }
-
-    return (await response.json()) as WorkflowInstance;
   }
 }
 
