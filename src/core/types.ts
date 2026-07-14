@@ -31,6 +31,17 @@ export interface WorkflowLogger {
 
 export interface WorkflowStepOptions {
   retry?: RetryPolicy | false;
+  /**
+   * Maximum time in ms to wait for the step function before the attempt is
+   * treated as failed (and retried, if a retry policy applies).
+   *
+   * HAZARD: JavaScript promises cannot be cancelled, so a timed-out attempt
+   * keeps running in the background even though its result is discarded. When a
+   * `timeoutMs` is combined with a retry policy, a slow step body can therefore
+   * execute concurrently with its own retry. Only apply `timeoutMs` to
+   * idempotent steps — do not rely on the timeout to stop a non-idempotent side
+   * effect (sending an email, charging a card) from firing more than once.
+   */
   timeoutMs?: number;
 }
 
@@ -174,4 +185,12 @@ export interface RetryPolicy {
   multiplier: number;
   /** Maximum backoff in ms (default: 30_000). */
   maxIntervalMs: number;
+  /**
+   * Optional jitter fraction in the range 0..1 applied to each backoff delay to
+   * avoid synchronized retry storms (thundering herd) against a shared
+   * dependency. When set, the computed delay is multiplied by
+   * `(1 - jitter * Math.random())`, i.e. randomly reduced by up to `jitter` of
+   * its value. Defaults to `undefined` (no jitter — exact exponential backoff).
+   */
+  jitter?: number;
 }

@@ -1,5 +1,5 @@
 import { DEFAULT_RETRY_POLICY } from "../helpers/retry";
-import { createTraceId, createWorkflowId } from "../core/id";
+import { createWorkflowId } from "../core/id";
 import type { WorkflowRegistry } from "../core/registry";
 import type {
   DispatchOptions,
@@ -30,7 +30,14 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown, TServices = u
 ) {
   return class GenericCloudflareWorkflowEntrypoint extends Base {
     async run(
-      event: { payload: WorkflowEventEnvelope | LegacyWorkflowPayload },
+      event: {
+        payload: WorkflowEventEnvelope | LegacyWorkflowPayload;
+        // Cloudflare supplies a stable per-instance id and the enqueue timestamp
+        // on the WorkflowEvent; both are used to keep the legacy normalization
+        // path deterministic across replays.
+        instanceId?: string;
+        timestamp?: Date | number;
+      },
       step: {
         do<T>(
           name: string,
@@ -55,13 +62,18 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown, TServices = u
           ? (config.services as (env: TEnv) => TServices)(env)
           : config.services;
 
-      const envelope = normalizeWorkflowEnvelope(event.payload);
+      const envelope = normalizeWorkflowEnvelope(event);
       const workflow = registry.get(envelope.name);
       const payload = registry.parsePayload(
         workflow,
         envelope.payload,
       );
       await sleepUntilScheduledAt(envelope, step);
+
+      // Counter used to give each nested ctx.dispatch a stable, unique step name
+      // so its result is memoized across replays without colliding with sibling
+      // dispatches to the same workflow name.
+      let dispatchCount = 0;
 
       return workflow.run(
         {
@@ -79,7 +91,13 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown, TServices = u
               retry: options?.retry ?? workflow.retry ?? DEFAULT_RETRY_POLICY,
               timeoutMs: options?.timeoutMs ?? workflow.timeoutMs,
             });
-            return stepConfig ? step.do(name, stepConfig, fn) : step.do(name, fn);
+            // Translate SDK-convention non-retryable markers into Cloudflare's
+            // native NonRetryableError so its retry engine stops early, matching
+            // the fail-fast behaviour of withRetry() on Bun.
+            const wrapped = wrapNonRetryable(fn);
+            return stepConfig
+              ? step.do(name, stepConfig, wrapped)
+              : step.do(name, wrapped);
           },
           async sleep(
             name: string,
@@ -92,11 +110,19 @@ export function createCloudflareWorkflowEntrypoint<TEnv = unknown, TServices = u
             payload: TPayload,
             options?: DispatchOptions,
           ): Promise<DispatchResult> {
-            if (config.dispatch) {
-              return config.dispatch(name, payload, options, env);
+            const dispatchFn = config.dispatch;
+            if (!dispatchFn) {
+              throw new Error(
+                "ctx.dispatch requires CloudflareRunnerConfig.dispatch.",
+              );
             }
-            throw new Error(
-              "ctx.dispatch requires CloudflareRunnerConfig.dispatch.",
+            // Wrap the dispatch in step.do so the created instance (and its
+            // generated id) is memoized. Cloudflare replays run() from the top
+            // after a sleep, a retried step, or crash recovery; an unwrapped
+            // dispatch would re-fire and start a duplicate workflow instance.
+            // DispatchResult is JSON-serializable, so it survives step storage.
+            return step.do(`dispatch:${name}:${dispatchCount++}`, () =>
+              dispatchFn(name, payload, options, env),
             );
           },
         },
@@ -115,27 +141,36 @@ export interface LegacyWorkflowPayload {
   delayMs?: number;
 }
 
-function normalizeWorkflowEnvelope(
-  payload: WorkflowEventEnvelope | LegacyWorkflowPayload,
-): WorkflowEventEnvelope {
+function normalizeWorkflowEnvelope(event: {
+  payload: WorkflowEventEnvelope | LegacyWorkflowPayload;
+  instanceId?: string;
+  timestamp?: Date | number;
+}): WorkflowEventEnvelope {
+  const payload = event.payload;
   if ("name" in payload && "payload" in payload) return payload;
 
-  const now = new Date();
+  // Legacy path: run() re-executes on every Cloudflare replay, so any generated
+  // id/timestamp must be derived from stable inputs (the CF instance id and
+  // enqueue timestamp) rather than fresh randomness/`Date.now()`. Only when the
+  // platform provides neither do we fall back to a random id.
+  const base =
+    event.timestamp !== undefined ? new Date(event.timestamp) : new Date();
+  const id = payload.eventId ?? event.instanceId ?? createWorkflowId();
   const delayMs =
     typeof payload.delayMs === "number" && payload.delayMs > 0
       ? payload.delayMs
       : undefined;
 
   return {
-    id: payload.eventId ?? createWorkflowId(),
+    id,
     name: payload.eventName ?? "",
     payload: payload.data ?? {},
-    traceId: payload.traceId ?? createTraceId(),
-    idempotencyKey: payload.idempotencyKey ?? createWorkflowId("idem"),
+    traceId: payload.traceId ?? `trace_${id}`,
+    idempotencyKey: payload.idempotencyKey ?? id,
     scheduledAt: delayMs
-      ? new Date(now.getTime() + delayMs).toISOString()
+      ? new Date(base.getTime() + delayMs).toISOString()
       : undefined,
-    createdAt: now.toISOString(),
+    createdAt: base.toISOString(),
   };
 }
 
@@ -171,27 +206,91 @@ function toCloudflareStepConfig(
   if (options.retry === false) {
     config.retries = { limit: 1, delay: 0, backoff: "constant" };
   } else if (options.retry) {
-    config.retries = {
-      limit: options.retry.maxAttempts + 1,
-      delay: options.retry.initialIntervalMs,
-      backoff: options.retry.multiplier > 1 ? "exponential" : "constant",
-    };
+    const { maxAttempts, initialIntervalMs, multiplier, maxIntervalMs } =
+      options.retry;
+    const limit = maxAttempts + 1;
+    const uncappedMaxDelay =
+      initialIntervalMs * multiplier ** Math.max(0, limit - 1);
+
+    if (multiplier > 1 && uncappedMaxDelay > maxIntervalMs) {
+      // Cloudflare's static retries config has no max-delay field, so
+      // exponential growth would be uncapped for the full limit — unlike Bun,
+      // where getBackoffDelay() applies Math.min(delay, maxIntervalMs). Supply a
+      // delay *function* that reproduces that ceiling. When `delay` is a
+      // function Cloudflare ignores the `backoff` field, so it is omitted.
+      config.retries = {
+        limit,
+        delay: ({ ctx }: { ctx: { attempt: number } }) =>
+          Math.min(
+            initialIntervalMs * multiplier ** Math.max(0, ctx.attempt - 1),
+            maxIntervalMs,
+          ),
+      };
+    } else {
+      config.retries = {
+        limit,
+        delay: initialIntervalMs,
+        backoff: multiplier > 1 ? "exponential" : "constant",
+      };
+    }
   }
 
   return config;
 }
 
-function toCloudflareDuration(durationOrDate: number | Date | string): string {
+function toCloudflareDuration(durationOrDate: number | Date | string): string | number {
   if (typeof durationOrDate === "string") return durationOrDate;
 
-  const ms =
-    durationOrDate instanceof Date
-      ? Math.max(0, durationOrDate.getTime() - Date.now())
-      : Math.max(0, durationOrDate);
+  // Cloudflare's step.sleep accepts a plain number of milliseconds directly. Its
+  // string duration grammar has no millisecond unit, so building a string is
+  // both unnecessary and wrong for sub-second durations — always pass the number.
+  return durationOrDate instanceof Date
+    ? Math.max(0, durationOrDate.getTime() - Date.now())
+    : Math.max(0, durationOrDate);
+}
 
-  if (ms < 1_000) return `${Math.max(1, Math.ceil(ms))} milliseconds`;
-  if (ms < 60_000) return `${Math.ceil(ms / 1_000)} seconds`;
-  if (ms < 3_600_000) return `${Math.ceil(ms / 60_000)} minutes`;
-  if (ms < 86_400_000) return `${Math.ceil(ms / 3_600_000)} hours`;
-  return `${Math.ceil(ms / 86_400_000)} days`;
+type NonRetryableErrorConstructor = new (message: string) => Error;
+
+// `cloudflare:workflows` only exists inside the Workers runtime; importing it
+// eagerly (or by a literal specifier) would break the SDK's dependency-free
+// promise on Bun/Node. Resolve it lazily via an indirected specifier and cache
+// the (possibly failed) lookup so translation is best-effort.
+const CLOUDFLARE_WORKFLOWS_MODULE: string = "cloudflare:workflows";
+let cloudflareNonRetryableErrorPromise:
+  | Promise<NonRetryableErrorConstructor | null>
+  | undefined;
+
+function loadCloudflareNonRetryableError(): Promise<NonRetryableErrorConstructor | null> {
+  if (!cloudflareNonRetryableErrorPromise) {
+    cloudflareNonRetryableErrorPromise = import(CLOUDFLARE_WORKFLOWS_MODULE)
+      .then(
+        (module: { NonRetryableError?: NonRetryableErrorConstructor }) =>
+          module.NonRetryableError ?? null,
+      )
+      .catch(() => null);
+  }
+  return cloudflareNonRetryableErrorPromise;
+}
+
+function isSdkNonRetryableError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as { nonRetryable?: unknown; name?: unknown };
+  return candidate.nonRetryable === true || candidate.name === "NonRetryableError";
+}
+
+function wrapNonRetryable<T>(fn: () => Promise<T> | T): () => Promise<T> {
+  return async () => {
+    try {
+      return await fn();
+    } catch (error) {
+      if (isSdkNonRetryableError(error)) {
+        const NonRetryableError = await loadCloudflareNonRetryableError();
+        if (NonRetryableError) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new NonRetryableError(message);
+        }
+      }
+      throw error;
+    }
+  };
 }

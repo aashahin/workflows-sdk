@@ -1,9 +1,49 @@
 import type { RegisteredWorkflow, WorkflowPayload } from "../core/types";
-import type { CronDefinition, CronRun } from "./types";
+import type { CronDefinition, CronRun, MissedRunPolicy } from "./types";
 
-type BunCronParser = {
-  next?(from?: Date): Date | null;
+const DEFAULT_MAX_DELAY_MS = 3_600_000;
+
+const MONTH_NAMES: Record<string, number> = {
+  JAN: 1,
+  FEB: 2,
+  MAR: 3,
+  APR: 4,
+  MAY: 5,
+  JUN: 6,
+  JUL: 7,
+  AUG: 8,
+  SEP: 9,
+  OCT: 10,
+  NOV: 11,
+  DEC: 12,
 };
+
+const DOW_NAMES: Record<string, number> = {
+  SUN: 0,
+  MON: 1,
+  TUE: 2,
+  WED: 3,
+  THU: 4,
+  FRI: 5,
+  SAT: 6,
+};
+
+interface CronField {
+  values: Set<number>;
+  isStar: boolean;
+}
+
+interface ParsedCron {
+  hasSeconds: boolean;
+  second: Set<number>;
+  minute: Set<number>;
+  hour: Set<number>;
+  dom: Set<number>;
+  month: Set<number>;
+  dow: Set<number>;
+  domRestricted: boolean;
+  dowRestricted: boolean;
+}
 
 export function normalizeCronDefinitions(
   workflow: RegisteredWorkflow,
@@ -69,36 +109,11 @@ export function getNextCronDateInTimezone(
   from = new Date(),
   timezone?: string,
 ): Date {
+  const parsed = parseCron(schedule);
   const cronFrom = toCronParserDate(from, timezone);
-  const next = parseNextCronDate(schedule, cronFrom);
+  const next = computeNextCronDate(parsed, cronFrom);
 
   return fromCronParserDate(next, timezone);
-}
-
-function parseNextCronDate(schedule: string, from: Date): Date {
-  const bun = (globalThis as { Bun?: unknown }).Bun as
-    | {
-        cron?: {
-          parse?: (
-            schedule: string,
-            relativeDate?: Date | number,
-          ) => Date | null | BunCronParser;
-        };
-      }
-    | undefined;
-
-  const parsed = bun?.cron?.parse?.(schedule, from);
-  const next =
-    parsed instanceof Date
-      ? parsed
-      : parsed && "next" in parsed
-        ? parsed.next?.(from)
-        : null;
-  if (next instanceof Date && !Number.isNaN(next.getTime())) {
-    return next;
-  }
-
-  return fallbackNextCronDate(schedule, from);
 }
 
 export function collectDueCronRuns(
@@ -109,142 +124,304 @@ export function collectDueCronRuns(
   const runs: CronRun[] = [];
 
   for (const cron of normalizeCronDefinitions(workflow)) {
+    const policy: MissedRunPolicy = cron.missedRunPolicy ?? "skip";
+    const timezone = cron.timezone ?? defaultTimezone;
     const maxRuns =
-      typeof cron.missedRunPolicy === "object" &&
-      cron.missedRunPolicy.mode === "catch-up-all"
-        ? Math.max(1, cron.missedRunPolicy.maxRuns)
+      typeof policy === "object" && policy.mode === "catch-up-all"
+        ? Math.max(1, policy.maxRuns)
         : 1;
-    for (const previous of getPreviousCronDates(
+
+    const occurrences = getPreviousCronDates(
       cron.schedule,
-        now,
-        maxRuns,
-        cron.timezone ?? defaultTimezone,
-      )) {
-      if (previous.getTime() <= now.getTime()) {
-        runs.push(createCronRun(workflow, cron, previous));
-      }
+      now,
+      maxRuns,
+      timezone,
+    );
+
+    for (const occurrence of selectDueOccurrences(
+      policy,
+      occurrences,
+      now,
+      cron.maxDelayMs,
+    )) {
+      runs.push(createCronRun(workflow, cron, occurrence));
     }
   }
 
   return runs;
 }
 
+// Applies the missed-run policy to the ascending list of past occurrences
+// (all <= now, oldest first, newest last) collected for a single cron.
+function selectDueOccurrences(
+  policy: MissedRunPolicy,
+  occurrences: Date[],
+  now: Date,
+  maxDelayMs?: number,
+): Date[] {
+  if (occurrences.length === 0) return [];
+
+  // catch-up-all: dispatch every collected occurrence in chronological order.
+  if (typeof policy === "object") return occurrences;
+
+  const latest = occurrences[occurrences.length - 1]!;
+
+  // catch-up-latest: always dispatch the most recent missed occurrence.
+  if (policy === "catch-up-latest") return [latest];
+
+  // skip (default): only dispatch when the most recent occurrence is still
+  // fresh; a run missed longer than maxDelayMs ago is dropped.
+  const maxDelay = maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+  return now.getTime() - latest.getTime() <= maxDelay ? [latest] : [];
+}
+
+// Returns up to `maxRuns` occurrences at or before `now`, oldest first.
 function getPreviousCronDates(
   schedule: string,
   now: Date,
   maxRuns: number,
   timezone?: string,
 ): Date[] {
-  const parsedPrevious = getPreviousCronDatesFromBun(
-    schedule,
-    now,
-    maxRuns,
-    timezone,
-  );
-  if (parsedPrevious.length > 0) return parsedPrevious;
+  const parsed = parseCron(schedule);
+  const results: Date[] = [];
 
-  // Fallback for non-Bun runtimes. This intentionally handles only the common
-  // simple cron subset used in tests and docs; Bun owns production parsing.
-  return [fallbackPreviousCronDate(schedule, toCronParserDate(now, timezone))].map(
-    (date) => fromCronParserDate(date, timezone),
-  );
+  let cursor = toCronParserDate(now, timezone);
+  for (let index = 0; index < maxRuns; index++) {
+    const previous = computePreviousCronDate(parsed, cursor);
+    results.unshift(fromCronParserDate(previous, timezone));
+    cursor = new Date(previous.getTime() - 1);
+  }
+
+  return results;
 }
 
-function fallbackPreviousCronDate(schedule: string, now: Date): Date {
+// ---------------------------------------------------------------------------
+// Cron parser + next/previous occurrence engine.
+//
+// All arithmetic runs on the "cron-parser frame" date produced by
+// toCronParserDate(), whose UTC getter/setter fields represent the wall-clock
+// time in the target timezone. Every field access below therefore uses the
+// getUTC*/setUTC* family so the computation stays internally consistent no
+// matter what the host timezone is.
+// ---------------------------------------------------------------------------
+
+function parseCron(schedule: string): ParsedCron {
   const parts = schedule.trim().split(/\s+/);
   if (parts.length !== 5 && parts.length !== 6) {
     throw new Error(`Unsupported cron expression "${schedule}"`);
   }
 
   const hasSeconds = parts.length === 6;
-  const second = hasSeconds ? parseField(parts[0]!, 0, now.getSeconds()) : 0;
-  const minute = parseField(parts[hasSeconds ? 1 : 0]!, 0, now.getMinutes());
-  const hour = parseField(parts[hasSeconds ? 2 : 1]!, 0, now.getHours());
+  const offset = hasSeconds ? 1 : 0;
 
-  const previous = new Date(now);
-  previous.setMilliseconds(0);
-  previous.setSeconds(second);
-  previous.setMinutes(minute);
-  previous.setHours(hour);
+  const second = hasSeconds
+    ? parseCronField(parts[0]!, 0, 59)
+    : { values: new Set<number>([0]), isStar: false };
+  const minute = parseCronField(parts[offset]!, 0, 59);
+  const hour = parseCronField(parts[offset + 1]!, 0, 23);
+  const dom = parseCronField(parts[offset + 2]!, 1, 31);
+  const month = parseCronField(parts[offset + 3]!, 1, 12, MONTH_NAMES);
+  const dow = parseCronField(
+    parts[offset + 4]!,
+    0,
+    7,
+    DOW_NAMES,
+    (value) => value % 7,
+  );
 
-  if (previous.getTime() > now.getTime()) {
-    previous.setDate(previous.getDate() - 1);
-  }
-
-  return previous;
+  return {
+    hasSeconds,
+    second: second.values,
+    minute: minute.values,
+    hour: hour.values,
+    dom: dom.values,
+    month: month.values,
+    dow: dow.values,
+    domRestricted: !dom.isStar,
+    dowRestricted: !dow.isStar,
+  };
 }
 
-function getPreviousCronDatesFromBun(
-  schedule: string,
-  now: Date,
-  maxRuns: number,
-  timezone?: string,
-): Date[] {
-  const cronNow = toCronParserDate(now, timezone);
+function parseCronField(
+  raw: string,
+  min: number,
+  max: number,
+  names?: Record<string, number>,
+  wrap?: (value: number) => number,
+): CronField {
+  const trimmed = raw.trim();
+  const isStar = trimmed === "*";
+  const values = new Set<number>();
 
-  const lookbackWindows = [
-    60_000,
-    3_600_000,
-    86_400_000,
-    7 * 86_400_000,
-    31 * 86_400_000,
-    366 * 86_400_000,
-  ];
-  let best: Date[] = [];
+  for (const token of trimmed.split(",")) {
+    if (token === "") {
+      throw new Error(`Invalid cron field "${raw}"`);
+    }
 
-  for (const lookbackMs of lookbackWindows) {
-    let cursor = new Date(cronNow.getTime() - lookbackMs);
-    const previous: Date[] = [];
-
-    for (let index = 0; index < 100_000; index++) {
-      const next = parseNextCronDate(schedule, cursor);
-      if (next.getTime() > cronNow.getTime()) {
-        if (previous.length > best.length) best = previous;
-        if (previous.length >= maxRuns) {
-          return previous
-            .slice(-maxRuns)
-            .map((date) => fromCronParserDate(date, timezone));
-        }
-        break;
+    let range = token;
+    let step = 1;
+    const slashIndex = token.indexOf("/");
+    if (slashIndex !== -1) {
+      range = token.slice(0, slashIndex);
+      step = Number(token.slice(slashIndex + 1));
+      if (!Number.isInteger(step) || step <= 0) {
+        throw new Error(`Invalid cron step "${token}" in "${raw}"`);
       }
-      previous.push(next);
-      cursor = new Date(next.getTime() + 1);
+    }
+
+    let lo: number;
+    let hi: number;
+    if (range === "*") {
+      lo = min;
+      hi = max;
+    } else {
+      const dashIndex = range.indexOf("-");
+      if (dashIndex > 0) {
+        lo = parseCronValue(range.slice(0, dashIndex), min, max, names, raw);
+        hi = parseCronValue(range.slice(dashIndex + 1), min, max, names, raw);
+      } else {
+        lo = parseCronValue(range, min, max, names, raw);
+        // A bare value with a step (e.g. "5/10") runs from the value to max.
+        hi = slashIndex !== -1 ? max : lo;
+      }
+    }
+
+    if (lo > hi) {
+      throw new Error(`Invalid cron range "${token}" in "${raw}"`);
+    }
+
+    for (let value = lo; value <= hi; value += step) {
+      values.add(wrap ? wrap(value) : value);
     }
   }
 
-  return best.slice(-maxRuns).map((date) => fromCronParserDate(date, timezone));
+  return { values, isStar };
 }
 
-function fallbackNextCronDate(schedule: string, from: Date): Date {
-  const parts = schedule.trim().split(/\s+/);
-  if (parts.length !== 5 && parts.length !== 6) {
-    throw new Error(`Unsupported cron expression "${schedule}"`);
+function parseCronValue(
+  raw: string,
+  min: number,
+  max: number,
+  names: Record<string, number> | undefined,
+  field: string,
+): number {
+  const token = raw.trim();
+  let value: number;
+
+  const named = names?.[token.toUpperCase()];
+  if (named !== undefined) {
+    value = named;
+  } else {
+    if (!/^\d+$/.test(token)) {
+      throw new Error(`Invalid cron value "${raw}" in "${field}"`);
+    }
+    value = Number(token);
   }
 
-  const hasSeconds = parts.length === 6;
-  const second = hasSeconds ? parseField(parts[0]!, 0, 0) : 0;
-  const minute = parseField(parts[hasSeconds ? 1 : 0]!, 0, 0);
-  const hour = parseField(parts[hasSeconds ? 2 : 1]!, 0, 0);
-
-  const next = new Date(from);
-  next.setMilliseconds(0);
-  next.setSeconds(second);
-  next.setMinutes(minute);
-  next.setHours(hour);
-
-  if (next.getTime() <= from.getTime()) {
-    next.setDate(next.getDate() + 1);
+  if (value < min || value > max) {
+    throw new Error(
+      `Cron value "${raw}" out of range ${min}-${max} in "${field}"`,
+    );
   }
 
-  return next;
+  return value;
 }
 
-function parseField(field: string, fallback: number, current: number): number {
-  if (field === "*") return current;
-  if (field.startsWith("*/")) return current - (current % Number(field.slice(2)));
-  const parsed = Number(field);
-  return Number.isFinite(parsed) ? parsed : fallback;
+// Vixie-cron day matching: when both DOM and DOW are restricted a date matches
+// if EITHER matches; otherwise only the restricted field(s) must match.
+function matchesDayRule(parsed: ParsedCron, date: Date): boolean {
+  const domMatch = parsed.dom.has(date.getUTCDate());
+  const dowMatch = parsed.dow.has(date.getUTCDay());
+
+  if (parsed.domRestricted && parsed.dowRestricted) return domMatch || dowMatch;
+  if (parsed.dowRestricted) return dowMatch;
+  return domMatch;
 }
+
+const MAX_CRON_ITERATIONS = 100_000;
+
+function computeNextCronDate(parsed: ParsedCron, from: Date): Date {
+  const date = new Date(from.getTime());
+  date.setUTCMilliseconds(0);
+  if (parsed.hasSeconds) {
+    date.setUTCSeconds(date.getUTCSeconds() + 1);
+  } else {
+    date.setUTCSeconds(0);
+    date.setUTCMinutes(date.getUTCMinutes() + 1);
+  }
+
+  for (let iteration = 0; iteration < MAX_CRON_ITERATIONS; iteration++) {
+    if (!parsed.month.has(date.getUTCMonth() + 1)) {
+      date.setUTCMonth(date.getUTCMonth() + 1, 1);
+      date.setUTCHours(0, 0, 0, 0);
+      continue;
+    }
+    if (!matchesDayRule(parsed, date)) {
+      date.setUTCDate(date.getUTCDate() + 1);
+      date.setUTCHours(0, 0, 0, 0);
+      continue;
+    }
+    if (!parsed.hour.has(date.getUTCHours())) {
+      date.setUTCHours(date.getUTCHours() + 1, 0, 0, 0);
+      continue;
+    }
+    if (!parsed.minute.has(date.getUTCMinutes())) {
+      date.setUTCMinutes(date.getUTCMinutes() + 1, 0, 0);
+      continue;
+    }
+    if (parsed.hasSeconds && !parsed.second.has(date.getUTCSeconds())) {
+      date.setUTCSeconds(date.getUTCSeconds() + 1, 0);
+      continue;
+    }
+    return date;
+  }
+
+  throw new Error("Unable to compute next cron occurrence");
+}
+
+function computePreviousCronDate(parsed: ParsedCron, from: Date): Date {
+  const maxSecond = parsed.hasSeconds ? 59 : 0;
+  const date = new Date(from.getTime());
+  date.setUTCMilliseconds(0);
+  if (!parsed.hasSeconds) date.setUTCSeconds(0);
+
+  for (let iteration = 0; iteration < MAX_CRON_ITERATIONS; iteration++) {
+    if (!parsed.month.has(date.getUTCMonth() + 1)) {
+      // Jump to the last day of the previous month.
+      date.setUTCDate(0);
+      date.setUTCHours(23, 59, maxSecond, 0);
+      continue;
+    }
+    if (!matchesDayRule(parsed, date)) {
+      date.setUTCDate(date.getUTCDate() - 1);
+      date.setUTCHours(23, 59, maxSecond, 0);
+      continue;
+    }
+    if (!parsed.hour.has(date.getUTCHours())) {
+      date.setUTCHours(date.getUTCHours() - 1, 59, maxSecond, 0);
+      continue;
+    }
+    if (!parsed.minute.has(date.getUTCMinutes())) {
+      date.setUTCMinutes(date.getUTCMinutes() - 1, maxSecond, 0);
+      continue;
+    }
+    if (parsed.hasSeconds && !parsed.second.has(date.getUTCSeconds())) {
+      date.setUTCSeconds(date.getUTCSeconds() - 1, 0);
+      continue;
+    }
+    return date;
+  }
+
+  throw new Error("Unable to compute previous cron occurrence");
+}
+
+// ---------------------------------------------------------------------------
+// Timezone projection helpers.
+//
+// toCronParserDate() projects a real UTC instant into a "fake UTC" Date whose
+// UTC fields spell out the wall-clock time in the target timezone;
+// fromCronParserDate() reverses the projection.
+// ---------------------------------------------------------------------------
 
 function toCronParserDate(date: Date, timezone?: string): Date {
   if (!timezone || timezone.toUpperCase() === "UTC") return date;

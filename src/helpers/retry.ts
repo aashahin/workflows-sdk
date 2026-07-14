@@ -15,8 +15,20 @@ export function getBackoffDelay(
   attempt: number,
   policy: RetryPolicy = DEFAULT_RETRY_POLICY,
 ): number {
-  const delay = policy.initialIntervalMs * Math.pow(policy.multiplier, attempt);
-  return Math.min(delay, policy.maxIntervalMs);
+  const delay = Math.min(
+    policy.initialIntervalMs * Math.pow(policy.multiplier, attempt),
+    policy.maxIntervalMs,
+  );
+
+  // Optional jitter spreads out otherwise-synchronized retries so a recovering
+  // dependency isn't hit by identical backoff schedules (thundering herd).
+  // Default (undefined) preserves exact exponential backoff.
+  if (policy.jitter && policy.jitter > 0) {
+    const fraction = Math.min(policy.jitter, 1);
+    return delay * (1 - fraction * Math.random());
+  }
+
+  return delay;
 }
 
 /**

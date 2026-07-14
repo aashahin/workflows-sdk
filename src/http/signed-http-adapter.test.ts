@@ -113,4 +113,65 @@ describe("SignedHttpAdapter", () => {
       expect((error as { nonRetryable?: boolean }).nonRetryable).toBe(true);
     }
   });
+
+  test("throws when the ids response drops envelopes", async () => {
+    const adapter = new SignedHttpAdapter({
+      baseUrl: "https://workflows.example.test",
+      authToken: "token",
+      fetch: (async () => Response.json({ ids: ["wf_ok"] })) as unknown as typeof fetch,
+    });
+
+    await expect(
+      adapter.dispatchBatch([
+        { ...envelope("email/send"), id: "wf_ok" },
+        { ...envelope("email/nope"), id: "wf_bad" },
+      ]),
+    ).rejects.toThrow("1/2 instances");
+  });
+
+  test("getInstance wraps network errors in WorkflowSendError", async () => {
+    const adapter = new SignedHttpAdapter({
+      baseUrl: "https://workflows.example.test",
+      authToken: "token",
+      fetch: (async () => {
+        throw new TypeError("connection reset");
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(adapter.getInstance("wf_1", { name: "email/send" })).rejects.toThrow(
+      "Failed to fetch workflow status: connection reset",
+    );
+  });
+
+  test("getInstance aborts using the configured timeout", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const adapter = new SignedHttpAdapter({
+      baseUrl: "https://workflows.example.test",
+      authToken: "token",
+      timeoutMs: 5,
+      fetch: ((_url: URL, init?: RequestInit) => {
+        observedSignal = init?.signal ?? undefined;
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(
+      adapter.getInstance("wf_1", { name: "email/send" }),
+    ).rejects.toThrow("Failed to fetch workflow status");
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  test("getInstance returns null on 404", async () => {
+    const adapter = new SignedHttpAdapter({
+      baseUrl: "https://workflows.example.test",
+      authToken: "token",
+      fetch: (async () => new Response("not found", { status: 404 })) as unknown as typeof fetch,
+    });
+
+    expect(await adapter.getInstance("wf_1", { name: "email/send" })).toBeNull();
+  });
 });

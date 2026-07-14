@@ -71,6 +71,35 @@ describe("CloudflareRestWorkflowAdapter", () => {
     });
   });
 
+  test("dispatchBatch attaches dispatched/failed ids on mid-batch failure", async () => {
+    let call = 0;
+    const adapter = new CloudflareRestWorkflowAdapter({
+      accountId: "acct_1",
+      apiToken: "token",
+      workflowName: "email-workflow",
+      baseUrl: "https://api.example.test/client/v4",
+      fetch: async () => {
+        call++;
+        if (call === 1) {
+          return Response.json({ success: true, result: { id: "wf_1", status: "queued" } });
+        }
+        return new Response("boom", { status: 500 });
+      },
+    });
+
+    const first = { ...envelope(), id: "wf_1" };
+    const second = { ...envelope(), id: "wf_2" };
+
+    try {
+      await adapter.dispatchBatch([first, second]);
+      throw new Error("expected dispatchBatch to throw");
+    } catch (error) {
+      const meta = error as { dispatchedIds?: string[]; failedIds?: string[] };
+      expect(meta.dispatchedIds).toEqual(["wf_1"]);
+      expect(meta.failedIds).toEqual(["wf_2"]);
+    }
+  });
+
   test("normalizes Cloudflare terminal status names", async () => {
     const adapter = new CloudflareRestWorkflowAdapter({
       accountId: "acct_1",

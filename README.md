@@ -19,6 +19,15 @@ Install the package with your preferred JavaScript package manager:
 
 The package exports TypeScript source files directly. Use it from runtimes and bundlers that can load TypeScript subpath exports, or compile it as part of your application build.
 
+### Runtime support
+
+This package publishes its TypeScript sources as its entry points; it does not ship a compiled `dist/`. It is therefore consumed directly by:
+
+- **Bun**, which runs TypeScript (and the `bun:sqlite`/`bun:test` imports used by the Bun adapter) natively, and
+- **bundler-based TypeScript toolchains** (Vite, esbuild, Wrangler, Webpack, etc.) that resolve and compile TypeScript subpath exports as part of your application build.
+
+Plain Node.js consuming the package without a TypeScript-aware loader/bundler, or a standalone `tsc` emit that expects prebuilt `.d.ts`/`.js` artifacts, is not supported. Compile the SDK as part of your own build if your toolchain requires that.
+
 ## Exports
 
 | Import path | Purpose |
@@ -180,27 +189,11 @@ The adapter uses Bun's `RedisClient` when available. Raw Redis commands are sent
 | Mode | Use case | Behavior |
 | --- | --- | --- |
 | `external` | Kubernetes CronJob, systemd timer, queue worker, tests | You call `runtime.tick()` and/or `runtime.processReady()` yourself |
-| `in-process` | Long-running Bun process | Registers `Bun.cron(schedule, handler)` and processes due work in the same process |
-| `os` | Single-server production cron | Registers `Bun.cron(path, schedule, title)` and expects the target module to export `scheduled()` |
-| `redis` | Multi-instance Bun deployment | Uses Bun cron as a wake-up mechanism and Redis for claims/leases |
+| `in-process` | Long-running Bun process | Schedules per-cron timers from the SDK's cron parser and processes due work in the same process (plus a periodic interval tick as a safety net) |
+| `redis` | Multi-instance Bun deployment | Periodic interval tick as a wake-up mechanism and Redis for claims/leases |
+| `os` | — | Not supported. `start()` throws: Bun has no OS cron registration API. Use `external` with your platform scheduler instead |
 
-For OS-level Bun cron, register cron jobs from the long-running app:
-
-```ts
-const runtime = createBunWorkflowRuntime({
-  registry,
-  adapter,
-  scheduler: {
-    mode: "os",
-    scriptPath: import.meta.path,
-    titlePrefix: "my-app-workflows",
-  },
-});
-
-runtime.start();
-```
-
-The target module must export Bun's scheduled handler:
+For an external scheduler (OS cron, Kubernetes CronJob, etc.), point it at a module that exports the scheduled handler:
 
 ```ts
 import {
@@ -213,12 +206,12 @@ export default createBunWorkflowScheduledHandler({
   registry,
   adapter: new BunSqliteWorkflowAdapter({ path: "workflows.sqlite" }),
   scheduler: {
-    mode: "os",
+    mode: "external",
   },
 });
 ```
 
-Bun cron uses standard 5-field cron expressions. Bun parses and runs in-process cron schedules in UTC. OS-level Bun cron follows the host timezone because it delegates to the platform scheduler. The SDK accounts for that in `scheduled()` by evaluating OS cron ticks in the local timezone unless a cron definition sets `timezone`.
+Cron expressions use the standard 5-field form (an optional leading seconds field makes it 6). The SDK's own parser supports ranges, lists, steps, month/day names, and standard DOM-vs-DOW OR semantics. Schedules are evaluated in UTC unless a cron definition sets `timezone`; `scheduled()` invocations triggered by an OS-level scheduler (`controller.cron` set) are evaluated in the host's local timezone unless a cron definition overrides it.
 
 ### Cron Idempotency
 
@@ -304,6 +297,8 @@ export default createCloudflareDispatchHandler({
 ```
 
 The handler calls the Cloudflare binding with `Workflow.create({ id, params })`. Scheduled envelopes are passed as params and delayed by the Workflow entrypoint helper.
+
+> **Rate limiting is best-effort.** The optional `rateLimit` option uses an in-memory fixed-window counter scoped to a single isolate. Cloudflare Workers run many isolates across PoPs, each with its own window, so the effective accepted rate is `max × <isolate count>` and a client spreading requests can bypass it. For true global enforcement, back it with a [Cloudflare Rate Limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) or a Durable Object counter.
 
 ### Workflow Entrypoint Helper
 
@@ -414,9 +409,8 @@ The root export includes:
 - Keep workflow instance IDs under Cloudflare's current instance ID limit when using the REST adapter.
 - Keep workflow names under Cloudflare's current workflow name limit when using the REST adapter.
 - Use unique, stable step names. Step results are keyed by instance ID and step name.
-- Do not rely on Bun's fallback cron parser for production semantics. Production Bun scheduling should use Bun's native cron support.
-- In-process Bun cron uses UTC. OS-level Bun cron uses the host timezone.
-- `Bun.cron(path, schedule, title)` re-registers the same title in place, so keep `titlePrefix`, workflow name, and cron name stable.
+- Cron schedules are parsed by the SDK's own parser on every runtime (full 5/6-field support: ranges, lists, steps, names, DOM/DOW OR semantics).
+- In-process cron timers evaluate in UTC unless a cron definition sets `timezone`; OS-triggered `scheduled()` ticks use the host timezone by default.
 - This package currently ships TypeScript source via exports; compile before publishing to runtimes that cannot load TypeScript directly.
 
 ## Verification
@@ -424,6 +418,6 @@ The root export includes:
 Useful package-level checks:
 
 ```bash
-bun test packages/workflows-sdk/src
-bunx tsc -p packages/workflows-sdk/tsconfig.json --noEmit
+bun test
+bunx tsc --noEmit
 ```

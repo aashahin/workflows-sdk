@@ -331,6 +331,7 @@ function parseCallbackSteps(value: unknown): BackendCallbackStep[] {
   }
 
   const steps: BackendCallbackStep[] = [];
+  const seenStepNames = new Set<string>();
 
   for (const [index, item] of value.entries()) {
     if (typeof item !== "object" || item === null || Array.isArray(item)) {
@@ -351,8 +352,16 @@ function parseCallbackSteps(value: unknown): BackendCallbackStep[] {
       );
     }
 
+    const stepName = step.stepName.trim();
+    if (seenStepNames.has(stepName)) {
+      throw new Error(
+        `Workflow callbackSteps metadata has duplicate stepName "${stepName}"`,
+      );
+    }
+    seenStepNames.add(stepName);
+
     const parsed: BackendCallbackStep = {
-      stepName: step.stepName.trim(),
+      stepName,
       backendPath: step.backendPath.trim(),
     };
     if (

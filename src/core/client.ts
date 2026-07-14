@@ -36,6 +36,7 @@ export class WorkflowClient {
       this.createEnvelope(event.name, event.payload, event.options),
     );
 
+    let instances: WorkflowInstance[];
     try {
       const dispatch = this.config.adapter.dispatchBatch
         ? this.config.adapter.dispatchBatch(envelopes)
@@ -43,23 +44,13 @@ export class WorkflowClient {
             envelopes.map((envelope) => this.config.adapter.dispatch(envelope)),
           );
 
-      const instances = await dispatch;
+      instances = await dispatch;
 
       if (instances.length !== envelopes.length) {
         throw new Error(
           `Workflow adapter dispatched ${instances.length}/${envelopes.length} event(s)`,
         );
       }
-
-      for (const envelope of envelopes) {
-        await this.config.hooks?.onDispatch?.(envelope);
-      }
-
-      return {
-        ids: instances.map((instance) => instance.id),
-        envelopes,
-        instances,
-      };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       for (const envelope of envelopes) {
@@ -67,6 +58,29 @@ export class WorkflowClient {
       }
       throw error;
     }
+
+    // The instances are durably created at this point. Run onDispatch hooks
+    // OUTSIDE the failure path and isolate each one, so a throwing hook can
+    // never make a successfully-created instance look failed (which would push
+    // the caller into re-dispatching and duplicating the workflow).
+    for (const envelope of envelopes) {
+      try {
+        await this.config.hooks?.onDispatch?.(envelope);
+      } catch (hookError) {
+        this.config.logger?.error?.("workflow.dispatch.hook_failed", {
+          id: envelope.id,
+          name: envelope.name,
+          error:
+            hookError instanceof Error ? hookError.message : String(hookError),
+        });
+      }
+    }
+
+    return {
+      ids: instances.map((instance) => instance.id),
+      envelopes,
+      instances,
+    };
   }
 
   getInstance(

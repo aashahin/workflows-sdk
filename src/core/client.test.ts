@@ -28,6 +28,54 @@ describe("workflow client", () => {
     });
   });
 
+  test("a throwing onDispatch hook does not fail a successful dispatch", async () => {
+    const adapter = new InMemoryWorkflowAdapter();
+    const errors: Array<{ message: string; context?: Record<string, unknown> }> =
+      [];
+    const client = createWorkflowClient({
+      adapter,
+      idGenerator: () => "wf_ok",
+      logger: {
+        error: (message, context) => errors.push({ message, context }),
+      },
+      hooks: {
+        onDispatch: () => {
+          throw new Error("hook exploded");
+        },
+      },
+    });
+
+    const result = await client.dispatch("email/send", { tenantId: "t1" });
+
+    // The instance was durably created, so the caller must still get its id.
+    expect(result.ids).toEqual(["wf_ok"]);
+    expect(adapter.instances.has("wf_ok")).toBe(true);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.message).toBe("workflow.dispatch.hook_failed");
+  });
+
+  test("onDispatchFailed still fires and rethrows when the adapter fails", async () => {
+    const failed: string[] = [];
+    const client = createWorkflowClient({
+      adapter: {
+        dispatch: async () => {
+          throw new Error("adapter down");
+        },
+        getInstance: async () => null,
+      },
+      hooks: {
+        onDispatchFailed: (envelope) => {
+          failed.push(envelope.name);
+        },
+      },
+    });
+
+    await expect(client.dispatch("email/send", {})).rejects.toThrow(
+      "adapter down",
+    );
+    expect(failed).toEqual(["email/send"]);
+  });
+
   test("registry rejects duplicate names", () => {
     const workflow = defineWorkflow("same/name", {
       run: () => undefined,
