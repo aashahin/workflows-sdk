@@ -34,6 +34,7 @@ export async function runWorkflowEnvelope<TServices = unknown>(
     workflow as RegisteredWorkflow<WorkflowPayload>,
     envelope.payload,
   );
+  options.registry.validateEvent?.(workflow, { ...envelope, payload });
 
   const client =
     options.client ??

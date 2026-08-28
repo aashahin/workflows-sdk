@@ -1,4 +1,5 @@
 import type { WorkflowRegistry } from "../core/registry";
+import { WorkflowValidationError } from "../core/errors";
 import type {
   RegisteredWorkflow,
   RetryPolicy,
@@ -59,6 +60,18 @@ export interface BackendCallbackWorkflowRegistryOptions {
   failedEventStepOptions?: WorkflowStepOptions;
   workflowRetry?: RetryPolicy | false;
   workflowTimeoutMs?: number;
+  /** Return true to allow a workflow name, or a reason string to reject it. */
+  workflowNamePolicy?: (workflowName: string) => true | string;
+  /**
+   * Validate explicit multi-step metadata for a specific workflow. An empty
+   * list means the normal implicit single callback whose path is the workflow
+   * name. Use this to keep a signed dispatch token from turning one Workflow
+   * instance into unrelated backend side effects.
+   */
+  callbackStepsPolicy?: (
+    workflowName: string,
+    steps: readonly BackendCallbackStep[],
+  ) => true | string;
 }
 
 type BackendCallbackMetadata = {
@@ -71,22 +84,16 @@ type BackendCallbackWorkflow = RegisteredWorkflow<
   BackendCallbackWorkflowServices
 >;
 
-const DEFAULT_STEP_RETRY: RetryPolicy = {
-  maxAttempts: 3,
-  initialIntervalMs: 1_000,
-  multiplier: 2,
-  maxIntervalMs: 30_000,
-};
-
 const FAILED_EVENT_RETRY: RetryPolicy = {
-  maxAttempts: 2,
+  maxAttempts: 1,
   initialIntervalMs: 1_000,
   multiplier: 1,
   maxIntervalMs: 1_000,
 };
 
 const DEFAULT_STEP_OPTIONS: WorkflowStepOptions = {
-  retry: DEFAULT_STEP_RETRY,
+  // Queue recovery is the single retry owner for backend side effects.
+  retry: false,
 };
 
 const DEFAULT_FAILED_EVENT_STEP_OPTIONS: WorkflowStepOptions = {
@@ -102,6 +109,8 @@ export function createBackendCallbackWorkflowRegistry(
     workflows: [],
     get(name: string) {
       const workflowName = normalizeWorkflowName(name);
+      const rejection = workflowNameRejection(workflowName, options);
+      if (rejection) throw new WorkflowValidationError(rejection);
       let workflow = workflows.get(workflowName);
       if (!workflow) {
         workflow = createBackendCallbackWorkflow(workflowName, options);
@@ -110,7 +119,11 @@ export function createBackendCallbackWorkflowRegistry(
       return workflow;
     },
     has(name: string) {
-      return normalizeWorkflowName(name).length > 0;
+      const workflowName = normalizeWorkflowName(name);
+      return (
+        workflowName.length > 0 &&
+        workflowNameRejection(workflowName, options) === null
+      );
     },
     names() {
       return [...workflows.keys()];
@@ -128,6 +141,13 @@ export function createBackendCallbackWorkflowRegistry(
       }
       return payload as TPayload;
     },
+    validateEvent(_workflow, envelope) {
+      validateCallbackSteps(
+        envelope.name,
+        envelope.metadata as BackendCallbackMetadata | undefined,
+        options,
+      );
+    },
   };
 }
 
@@ -137,8 +157,36 @@ export function isNonRetryableCallbackWorkflowFailure(error: unknown): boolean {
   return (
     error.name === "NonRetryableError" ||
     error.name === "NonRetryableWorkflowError" ||
-    error.message.includes("NonRetryableError")
+    error.message.startsWith("NonRetryableError:")
   );
+}
+
+/**
+ * Callback paths are URL path fragments, never URLs. Keep them inside the
+ * `/workflows/execute/` namespace even when metadata came from a signed caller.
+ */
+export function assertBackendCallbackPath(
+  value: string,
+  label = "Backend callback path",
+): void {
+  if (value.length === 0 || value.length > 512) {
+    throw new Error(`${label} must contain 1-512 characters`);
+  }
+  const segments = value.split("/");
+  if (
+    segments.some(
+      (segment) =>
+        segment.length === 0 ||
+        segment.length > 128 ||
+        segment === "." ||
+        segment === ".." ||
+        !/^[a-zA-Z0-9_][a-zA-Z0-9._-]*$/.test(segment),
+    )
+  ) {
+    throw new Error(
+      `${label} must use slash-separated alphanumeric, dot, underscore, or hyphen segments`,
+    );
+  }
 }
 
 function createBackendCallbackWorkflow(
@@ -166,7 +214,7 @@ function createBackendCallbackWorkflow(
       } catch (error) {
         const failedStep = steps[failedStepIndex]!;
         const remainingSteps = steps.slice(failedStepIndex);
-        const queued = await recordFailedEvent(ctx, payload, {
+        const failedEvent = createFailedEvent(ctx, payload, {
           backendPath: failedStep.backendPath,
           backendEventId: failedStep.backendEventId,
           backendSteps:
@@ -177,14 +225,10 @@ function createBackendCallbackWorkflow(
                 }))
               : undefined,
           error,
-          options,
         });
+        const queued = await recordFailedEvent(ctx, failedEvent, error, options);
         if (queued) {
-          return queuedForRetryResult(ctx, {
-            backendPath: failedStep.backendPath,
-            backendEventId: failedStep.backendEventId,
-            error,
-          });
+          return queuedForRetryResult(ctx, failedEvent);
         }
         throw error;
       }
@@ -218,51 +262,30 @@ async function executeBackendStep(
 
 async function recordFailedEvent(
   ctx: WorkflowRunContext<BackendCallbackWorkflowServices>,
-  payload: WorkflowPayload,
-  params: {
-    backendPath: string;
-    backendEventId: string;
-    backendSteps?: Array<{
-      backendPath: string;
-      backendEventId: string;
-    }>;
-    error: unknown;
-    options: BackendCallbackWorkflowRegistryOptions;
-  },
+  event: BackendCallbackFailedEvent,
+  originalError: unknown,
+  options: BackendCallbackWorkflowRegistryOptions,
 ): Promise<boolean> {
   if (
     !ctx.services.failedEvents ||
-    isNonRetryableCallbackWorkflowFailure(params.error)
+    isNonRetryableCallbackWorkflowFailure(originalError)
   ) {
     return false;
   }
 
-  const message =
-    params.error instanceof Error ? params.error.message : String(params.error);
-
   try {
     await ctx.step(
       "persist-failed-event",
-      () =>
-        ctx.services.failedEvents?.record({
-          eventId: ctx.event.id,
-          workflowName: ctx.event.name,
-          backendPath: params.backendPath,
-          backendEventId: params.backendEventId,
-          backendSteps: params.backendSteps,
-          payload,
-          idempotencyKey: ctx.idempotencyKey,
-          error: message,
-        }),
-      params.options.failedEventStepOptions ?? DEFAULT_FAILED_EVENT_STEP_OPTIONS,
+      () => ctx.services.failedEvents?.record(event),
+      options.failedEventStepOptions ?? DEFAULT_FAILED_EVENT_STEP_OPTIONS,
     );
     return true;
   } catch (recordError) {
     ctx.logger.error?.("workflow.failed_event_record_failed", {
       workflow: ctx.event.name,
       eventId: ctx.event.id,
-      backendPath: params.backendPath,
-      originalError: message,
+      backendPath: event.backendPath,
+      originalError: event.error,
       recordError:
         recordError instanceof Error
           ? recordError.message
@@ -274,22 +297,42 @@ async function recordFailedEvent(
 
 function queuedForRetryResult(
   ctx: WorkflowRunContext<BackendCallbackWorkflowServices>,
-  params: {
-    backendPath: string;
-    backendEventId: string;
-    error: unknown;
-  },
+  event: BackendCallbackFailedEvent,
 ) {
   return {
     status: "queued_for_retry",
     eventId: ctx.event.id,
     eventName: ctx.event.name,
+    backendPath: event.backendPath,
+    backendEventId: event.backendEventId,
+    error: event.error,
+  };
+}
+
+function createFailedEvent(
+  ctx: WorkflowRunContext<BackendCallbackWorkflowServices>,
+  payload: WorkflowPayload,
+  params: {
+    backendPath: string;
+    backendEventId: string;
+    backendSteps?: Array<{
+      backendPath: string;
+      backendEventId: string;
+    }>;
+    error: unknown;
+  },
+): BackendCallbackFailedEvent {
+  return {
+    eventId: ctx.event.id,
+    workflowName: ctx.event.name,
     backendPath: params.backendPath,
     backendEventId: params.backendEventId,
-    error:
-      params.error instanceof Error
-        ? params.error.message
-        : String(params.error),
+    ...(params.backendSteps === undefined
+      ? {}
+      : { backendSteps: params.backendSteps }),
+    payload,
+    idempotencyKey: ctx.idempotencyKey,
+    error: boundedError(params.error),
   };
 }
 
@@ -302,7 +345,11 @@ function getCallbackSteps(
   }
 > {
   const metadata = ctx.event.metadata as BackendCallbackMetadata | undefined;
-  const configuredSteps = parseCallbackSteps(metadata?.callbackSteps);
+  const configuredSteps = validateCallbackSteps(
+    ctx.event.name,
+    metadata,
+    options,
+  );
 
   if (configuredSteps.length === 0) {
     const backendPath = ctx.event.name;
@@ -322,12 +369,31 @@ function getCallbackSteps(
   }));
 }
 
+function validateCallbackSteps(
+  workflowName: string,
+  metadata: BackendCallbackMetadata | undefined,
+  options: BackendCallbackWorkflowRegistryOptions,
+): BackendCallbackStep[] {
+  const configuredSteps = parseCallbackSteps(metadata?.callbackSteps);
+  const stepRejection = options.callbackStepsPolicy?.(
+    workflowName,
+    configuredSteps,
+  );
+  if (typeof stepRejection === "string") {
+    throw new WorkflowValidationError(stepRejection);
+  }
+  return configuredSteps;
+}
+
 function parseCallbackSteps(value: unknown): BackendCallbackStep[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
     throw new Error(
       "Workflow callbackSteps metadata must be an array when provided",
     );
+  }
+  if (value.length > 3) {
+    throw new Error("Workflow callbackSteps metadata must contain at most 3 items");
   }
 
   const steps: BackendCallbackStep[] = [];
@@ -340,37 +406,85 @@ function parseCallbackSteps(value: unknown): BackendCallbackStep[] {
     }
 
     const step = item as Record<string, unknown>;
+    const stepName = parseRequiredMetadataString(
+      step.stepName,
+      `callbackSteps[${index}].stepName`,
+      256,
+    );
+    const backendPath = parseRequiredMetadataString(
+      step.backendPath,
+      `callbackSteps[${index}].backendPath`,
+      512,
+    );
     if (
-      typeof step.stepName !== "string" ||
-      step.stepName.trim().length === 0 ||
-      typeof step.backendPath !== "string" ||
-      step.backendPath.trim().length === 0
+      stepName === null ||
+      backendPath === null
     ) {
       throw new Error(
         `Workflow callbackSteps metadata item ${index} requires stepName and backendPath`,
       );
     }
+    assertBackendCallbackPath(
+      backendPath,
+      `Workflow callbackSteps[${index}].backendPath`,
+    );
 
     const parsed: BackendCallbackStep = {
-      stepName: step.stepName.trim(),
-      backendPath: step.backendPath.trim(),
+      stepName,
+      backendPath,
     };
-    if (
-      typeof step.backendEventId === "string" &&
-      step.backendEventId.trim().length > 0
-    ) {
-      parsed.backendEventId = step.backendEventId.trim();
-    }
-    if (
-      typeof step.backendEventIdSuffix === "string" &&
-      step.backendEventIdSuffix.trim().length > 0
-    ) {
-      parsed.backendEventIdSuffix = step.backendEventIdSuffix.trim();
+    const backendEventId = parseOptionalMetadataString(
+      step.backendEventId,
+      `callbackSteps[${index}].backendEventId`,
+      512,
+    );
+    const backendEventIdSuffix = parseOptionalMetadataString(
+      step.backendEventIdSuffix,
+      `callbackSteps[${index}].backendEventIdSuffix`,
+      256,
+    );
+    if (backendEventId !== undefined) parsed.backendEventId = backendEventId;
+    if (backendEventIdSuffix !== undefined) {
+      parsed.backendEventIdSuffix = backendEventIdSuffix;
     }
     steps.push(parsed);
   }
 
   return steps;
+}
+
+function parseRequiredMetadataString(
+  value: unknown,
+  field: string,
+  maxLength: number,
+): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 ||
+    normalized.length > maxLength ||
+    /[\u0000-\u001f\u007f]/.test(normalized)
+  ) {
+    throw new Error(
+      `Workflow ${field} must contain 1-${maxLength} printable characters`,
+    );
+  }
+  return normalized;
+}
+
+function parseOptionalMetadataString(
+  value: unknown,
+  field: string,
+  maxLength: number,
+): string | undefined {
+  if (value === undefined) return undefined;
+  const parsed = parseRequiredMetadataString(value, field, maxLength);
+  if (parsed === null) {
+    throw new Error(
+      `Workflow ${field} must contain 1-${maxLength} printable characters`,
+    );
+  }
+  return parsed;
 }
 
 function resolveBackendEventId(
@@ -388,6 +502,52 @@ function normalizeWorkflowName(name: string): string {
   return typeof name === "string" ? name.trim() : "";
 }
 
-function defaultStepName(workflowName: string): string {
-  return `callback-${workflowName.replace(/[^a-zA-Z0-9]+/g, "-")}`;
+function workflowNameRejection(
+  workflowName: string,
+  options: BackendCallbackWorkflowRegistryOptions,
+): string | null {
+  if (!workflowName) return "Workflow name must not be empty";
+  try {
+    assertBackendCallbackPath(workflowName, "Workflow name");
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  const decision = options.workflowNamePolicy?.(workflowName) ?? true;
+  return decision === true ? null : decision;
 }
+
+function boundedError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const clean = raw
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (clean || "Backend callback failed").slice(0, 2_048);
+}
+
+export function createBackendCallbackStepName(workflowName: string): string {
+  const prefix = "callback-";
+  const sanitized =
+    workflowName.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "") ||
+    "workflow";
+  const full = `${prefix}${sanitized}`;
+  if (full.length <= 256) return full;
+
+  const suffix = `-${stableStepNameHash(workflowName)}`;
+  return `${prefix}${sanitized.slice(0, 256 - prefix.length - suffix.length)}${suffix}`;
+}
+
+function stableStepNameHash(value: string): string {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ (code + index), 0x85ebca6b);
+  }
+  return `${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0)
+    .toString(16)
+    .padStart(8, "0")}`;
+}
+
+const defaultStepName = createBackendCallbackStepName;

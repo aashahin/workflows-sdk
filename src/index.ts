@@ -21,6 +21,8 @@ export {
   getNextCronDateInTimezone,
 } from "./scheduler/index";
 export {
+  assertBackendCallbackPath,
+  createBackendCallbackStepName,
   createBackendCallbackWorkflowRegistry,
   isNonRetryableCallbackWorkflowFailure,
 } from "./callback/backend-callback";

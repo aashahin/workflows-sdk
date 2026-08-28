@@ -5,6 +5,10 @@ import type { CronDefinition } from "../scheduler/types";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+/**
+ * Payloads remain structurally open for schema libraries, but every Cloudflare
+ * adapter validates them as JSON before crossing a Workflow boundary.
+ */
 export type WorkflowPayload = Record<string, unknown>;
 
 export type WorkflowStatus =
@@ -94,6 +98,14 @@ export interface WorkflowEventEnvelope<
 
 export interface DispatchOptions {
   id?: string;
+  /**
+   * Stable identity for a child Workflow dispatched from another Workflow.
+   * Cloudflare runners use this with the parent event identity to derive the
+   * child instance id and durable step name.
+   */
+  childKey?: string;
+  /** Stable event creation time for deterministic retries and child dispatches. */
+  createdAt?: Date | string;
   delayMs?: number;
   scheduledAt?: Date | string;
   idempotencyKey?: string;

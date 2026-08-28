@@ -81,8 +81,8 @@ export class WorkflowClient {
     payload: TPayload,
     options: DispatchOptions = {},
   ): WorkflowEventEnvelope<string, TPayload> {
-    const now = this.now();
-    const scheduledAt = resolveScheduledAt(now, options);
+    const createdAt = resolveCreatedAt(this.now(), options);
+    const scheduledAt = resolveScheduledAt(createdAt, options);
 
     return {
       id: options.id ?? this.idGenerator(),
@@ -90,9 +90,9 @@ export class WorkflowClient {
       payload,
       traceId: options.traceId ?? createTraceId(),
       idempotencyKey: options.idempotencyKey ?? createWorkflowId("idem"),
-      scheduledAt,
-      createdAt: now.toISOString(),
-      metadata: options.metadata,
+      ...(scheduledAt === undefined ? {} : { scheduledAt }),
+      createdAt: createdAt.toISOString(),
+      ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
     };
   }
 }
@@ -101,6 +101,12 @@ export function createWorkflowClient(
   config: WorkflowClientConfig,
 ): WorkflowClient {
   return new WorkflowClient(config);
+}
+
+function resolveCreatedAt(now: Date, options: DispatchOptions): Date {
+  if (options.createdAt instanceof Date) return options.createdAt;
+  if (typeof options.createdAt === "string") return new Date(options.createdAt);
+  return now;
 }
 
 function resolveScheduledAt(

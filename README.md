@@ -277,6 +277,11 @@ await client.dispatch("email/send", { tenantId: "tenant_123" });
 await client.getInstance("wf_123", { name: "email/send" });
 ```
 
+Both HTTP adapters keep at most 1,000 process-local instance-ID/name hints for
+convenient status lookups. Configure `instanceNameCacheSize` to change the LRU
+bound or set it to `0` to disable hints. For durable status tooling, always
+pass `options.name`; cache eviction never affects explicit-name lookups.
+
 The custom Worker endpoint must expose:
 
 | Endpoint | Purpose |
@@ -303,7 +308,24 @@ export default createCloudflareDispatchHandler({
 });
 ```
 
-The handler calls the Cloudflare binding with `Workflow.create({ id, params })`. Scheduled envelopes are passed as params and delayed by the Workflow entrypoint helper.
+The handler calls the Cloudflare binding with explicit success/error retention for both `Workflow.create()` and `createBatch()`. The default is one day for successful instances and three days for errors; pass `retention` to override it. Scheduled envelopes are passed as params and delayed by the Workflow entrypoint helper.
+
+For retry-safe deterministic IDs, provide `resolveReceiptStore` and the stable
+concrete binding name through `resolveWorkflowIdentity`. The receipt store keys
+that binding identity plus instance ID to a canonical SHA-256 envelope hash,
+uses a fenced five-minute creation lease, and persists an `ABSENCE_PROVEN` stage
+before the first create. Exact retries are deduplicated; a different envelope
+for the same ID is rejected. Ambiguous creates and batch omissions are accepted
+only when that durable absence proof preceded creation and status from the
+explicitly resolved binding now proves the instance exists.
+
+Receipts become eligible for cleanup checks after 31 days by default, but this
+is not a deletion TTL. Cleanup deletes only when the stored workflow name maps
+to the same concrete binding identity and that binding explicitly reports the
+instance missing. Existing or ambiguous instances are deferred for another
+bounded check. The default cleanup budget is two batches of six candidates;
+schedule the dedicated receipt cleanup cron every five minutes. Without a
+durable receipt store, duplicates remain fail-closed.
 
 ### Workflow Entrypoint Helper
 
@@ -330,8 +352,22 @@ The helper maps:
 
 - `ctx.step()` to `step.do()`
 - `ctx.sleep()` to `step.sleep()` or `step.sleepUntil()`
+- subsecond numeric sleeps to Cloudflare's millisecond duration API
+- `ctx.dispatch()` to a durable `step.do()` that creates the child Workflow
 - workflow retry/timeout options to Cloudflare step config
 - future `scheduledAt` envelopes to a durable Cloudflare sleep before user code runs
+
+Give every repeated child dispatch an explicit stable `childKey`. The runner derives a deterministic child instance ID and step name from the parent event plus that key, so replay cannot create another instance:
+
+```ts
+await ctx.dispatch(
+  "course/rebuild-part",
+  { courseId, part: 1 },
+  { childKey: "part-1" },
+);
+```
+
+One unnamed child per target workflow is allowed for compatibility; a second unnamed child to the same target is rejected as ambiguous. Workflow envelopes are validated as plain JSON and capped at 96 KB before any Cloudflare binding call.
 
 ### Direct Cloudflare REST API
 
@@ -375,7 +411,9 @@ to:
 /accounts/{account_id}/workflows/{workflow_name}/instances
 ```
 
-Status lookup requires either a prior dispatch through the same adapter instance or `getInstance(id, { name })`, because Cloudflare status endpoints are scoped to a workflow name.
+Status lookup requires either a recent prior dispatch retained by the adapter's
+bounded cache or `getInstance(id, { name })`, because Cloudflare status
+endpoints are scoped to a workflow name.
 
 ## Testing
 
@@ -404,7 +442,11 @@ The root export includes:
 - `WorkflowNotFoundError`
 - `WorkflowAlreadyClaimedError`
 
-`SignedHttpAdapter` marks most non-429 `4xx` responses as non-retryable by setting `error.nonRetryable = true`.
+`SignedHttpAdapter` marks deterministic dispatcher failures (`400`, `401`,
+`403`, `404`, `409`, `413`, and `422`) as non-retryable by setting
+`error.nonRetryable = true`. Rotate the dispatch bearer token with an explicit
+overlap/deploy procedure; repeated billed dispatch retries cannot repair an
+expired or mismatched credential.
 
 ## Production Notes
 

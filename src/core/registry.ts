@@ -1,6 +1,7 @@
 import { WorkflowNotFoundError, WorkflowValidationError } from "./errors";
 import type {
   RegisteredWorkflow,
+  WorkflowEventEnvelope,
   WorkflowPayload,
   WorkflowSchema,
 } from "./types";
@@ -16,6 +17,14 @@ export interface WorkflowRegistry<
     workflow: RegisteredWorkflow<TPayload>,
     payload: unknown,
   ): TPayload;
+  /**
+   * Optional envelope-level admission hook. Cloudflare dispatchers call this
+   * after payload parsing but before any Workflow binding create operation.
+   */
+  validateEvent?(
+    workflow: RegisteredWorkflow,
+    envelope: WorkflowEventEnvelope,
+  ): void;
 }
 
 export function defineWorkflowRegistry<
